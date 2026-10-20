@@ -1,15 +1,25 @@
 # btrfs-dup
 
-A minimal Btrfs snapshot scanner and extent deduplicator. The embedded
-SurrealDB store defaults to `./btrfs-dup.db`. Use the global `--db <path>`
-option to choose another store; the path can appear before or after the command.
+A minimal Btrfs snapshot scanner and extent deduplicator. The embedded LanceDB
+store defaults to `./btrfs-dup.lance`. Use the global `--db <path>` option to
+choose another store; the path can appear before or after the command. Existing
+SurrealDB data is not migrated or read.
+
+Build with the pinned Nix toolchain (including `protoc` and `libclang`):
+
+```sh
+nix develop --command cargo build --release
+nix build
+```
+
+Run the CLI or build without entering the development shell:
 
 ```text
-cargo run --                         # guided start
+cargo run --                         # guided start (inside nix develop)
 cargo run -- dedup /mnt/data
 cargo run -- dedup /dev/nvme0n1p2
-cargo run -- --db /var/lib/btrfs-dup dedup /mnt/data
-cargo run -- list --db /var/lib/btrfs-dup
+cargo run -- --db /var/lib/btrfs-dup.lance dedup /mnt/data
+cargo run -- list --db /var/lib/btrfs-dup.lance
 cargo run -- status <scan-id>
 cargo run -- resume <scan-id>
 cargo run -- dedup --resume <scan-id>
@@ -31,7 +41,12 @@ and uses 100 MiB chunks for files at least 2 GiB.
 XXH3 narrows candidate blocks; BLAKE3 is computed only when blocks with the
 same length and XXH3 collide. Matching `(length, XXH3, BLAKE3)` tuples are
 submitted to the Btrfs extent-deduplication ioctl against the writable source
-subvolume. Paths and digests are stored as binary values in SurrealDB.
+subvolume. LanceDB stores scan, block, checkpoint, and duplicate records in
+one table. Since LanceDB does not support composite B-tree indexes, block rows
+store a `UInt64` `hash_key` made by hashing the `(len, xxh3)` tuple and index
+that scalar with a B-tree. The original `len` and XXH3 values remain stored
+separately and are checked as the exact tuple; the derived key is not treated
+as a unique identifier.
 
 `--dry-run` still creates the snapshot and persists scan progress/index data,
 but does not call the deduplication ioctl. The snapshot is retained so scans
@@ -39,11 +54,11 @@ can be resumed. `resume` re-walks the immutable snapshot and uses stable
 database record IDs to avoid duplicating indexed block records.
 Resume skips files with persisted completion checkpoints and initializes the
 progress panel from their saved byte and block counts. New block records and
-file checkpoints are buffered and flushed to SurrealDB in batches at least
+file checkpoints are buffered and flushed to LanceDB in batches at least
 every 30 seconds and at scan completion; an abrupt stop can require redoing
 work since the latest flush.
 Each worker hashes a group of up to 256 files and commits their block rows in
-one array-bound SurrealQL loop. The coordinator later persists BLAKE3 collision
+one `merge_insert` operation. The coordinator later persists BLAKE3 collision
 upgrades, duplicate relationships, and completed-file checkpoints in periodic
 batches. A file checkpoint is not written until its candidate processing is
 complete.

@@ -23,12 +23,17 @@ use std::{
 
 use btrfs_uapi::dedupe::{DedupeResult, DedupeTarget, file_extent_same};
 use btrfs_uapi::subvolume;
-use serde::{Deserialize, Serialize};
-use surrealdb::{
-    Surreal,
-    engine::local::Db,
-    types::{Bytes, RecordId, RecordIdKey, SurrealValue, Value},
+use futures::TryStreamExt;
+use lancedb::{
+    Table,
+    arrow::{
+        arrow_array::{RecordBatch, RecordBatchIterator, StringArray, UInt64Array},
+        arrow_schema::{DataType, Field, Schema},
+    },
+    index::{Index, scalar::BTreeIndexBuilder},
+    query::{ExecutableQuery, QueryBase},
 };
+use serde::{Deserialize, Serialize};
 use twox_hash::XxHash3_64;
 
 const MIB: u64 = 1024 * 1024;
@@ -55,7 +60,7 @@ fn block_decision_function(file_size: u64) -> BlockDecision {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, SurrealValue)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct Scan {
     scan_id: Option<String>,
     source: String,
@@ -72,53 +77,47 @@ impl Scan {
     }
 }
 
-#[derive(Debug, Deserialize, SurrealValue)]
-struct ScanListRow {
-    id: RecordId,
-    scan_id: Option<String>,
-    source: String,
-    state: String,
-    dry_run: bool,
-    files: u64,
-    blocks: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Block {
     scan: String,
-    xxh3: Bytes,
+    xxh3: u64,
     len: usize,
-    path: Bytes,
+    path: Vec<u8>,
     offset: u64,
-    blake3: Option<Bytes>,
+    blake3: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ScannedFile {
     scan: String,
-    path: Bytes,
+    path: Vec<u8>,
     #[serde(default)]
     bytes: u64,
     #[serde(default)]
     blocks: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Duplicate {
     scan: String,
-    duplicate_path: Bytes,
+    duplicate_path: Vec<u8>,
     duplicate_offset: u64,
-    source_path: Bytes,
+    source_path: Vec<u8>,
     source_offset: u64,
     len: u64,
     deduped_bytes: u64,
     dry_run: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
-struct BatchRecord {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredRecord {
     id: String,
-    content: Value,
+    kind: String,
+    scan: String,
+    len: u64,
+    xxh3: u64,
+    hash_key: u64,
+    payload: String,
 }
 
 struct WriteBatch {
@@ -140,7 +139,7 @@ impl WriteBatch {
         }
     }
 
-    async fn flush(&mut self, db: &Surreal<Db>, scan: &Scan) -> Result<()> {
+    async fn flush(&mut self, table: &Table, scan: &Scan) -> Result<()> {
         if self.blocks.is_empty() && self.files.is_empty() && self.duplicates.is_empty() {
             self.last_flush = Instant::now();
             return Ok(());
@@ -148,58 +147,47 @@ impl WriteBatch {
         let blocks = std::mem::take(&mut self.blocks);
         let files = std::mem::take(&mut self.files);
         let duplicates = std::mem::take(&mut self.duplicates);
-        let block_records = blocks
+        let mut records = blocks
             .iter()
-            .map(|(id, block)| BatchRecord {
-                id: id.clone(),
-                content: block.clone().into_value(),
+            .map(|(id, block)| {
+                stored_record(
+                    id,
+                    "block",
+                    &block.scan,
+                    block.len as u64,
+                    &block.xxh3.to_be_bytes(),
+                    block,
+                )
             })
-            .collect::<Vec<_>>()
-            .into_value();
-        let file_records = files
-            .iter()
-            .map(|(id, file)| BatchRecord {
-                id: id.clone(),
-                content: file.clone().into_value(),
-            })
-            .collect::<Vec<_>>()
-            .into_value();
-        let duplicate_records = duplicates
-            .iter()
-            .map(|(id, duplicate)| BatchRecord {
-                id: id.clone(),
-                content: duplicate.clone().into_value(),
-            })
-            .collect::<Vec<_>>()
-            .into_value();
-        let db = db.clone();
-        let scan_id = scan.key().to_owned();
-        let scan = scan.clone().into_value();
-        let write = tokio::task::spawn_blocking(move || {
-            tokio::runtime::Handle::current().block_on(async move {
-                db.query(
-                "FOR $item IN $blocks { UPSERT type::record('block', $item.id) CONTENT $item.content; };
-                 FOR $item IN $files { UPSERT type::record('scanned_file', $item.id) CONTENT $item.content; };
-                 FOR $item IN $duplicates { UPSERT type::record('duplicate', $item.id) CONTENT $item.content; };
-                 UPSERT type::record('scan', $scan_id) CONTENT $scan;",
-            )
-            .bind(("blocks", block_records))
-            .bind(("files", file_records))
-            .bind(("duplicates", duplicate_records))
-            .bind(("scan_id", scan_id))
-            .bind(("scan", scan))
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-            })
-        })
-        .await
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
-        if let Err(error) = write {
+            .collect::<Result<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        records.extend(
+            files
+                .iter()
+                .map(|(id, file)| stored_record(id, "file", &file.scan, 0, &[], file))
+                .collect::<Result<Vec<_>>>()?,
+        );
+        records.extend(
+            duplicates
+                .iter()
+                .map(|(id, duplicate)| {
+                    stored_record(id, "duplicate", &duplicate.scan, 0, &[], duplicate)
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
+        records.push(stored_record(
+            &scan_record_id(scan.key()),
+            "scan",
+            scan.key(),
+            0,
+            &[],
+            scan,
+        )?);
+        if let Err(error) = write_records(table, records).await {
             self.blocks.extend(blocks);
             self.files.extend(files);
             self.duplicates.extend(duplicates);
-            return Err(error.into());
+            return Err(error);
         }
         for (id, block) in blocks {
             if block.blake3.is_none() {
@@ -407,6 +395,219 @@ fn format_duration(duration: Duration) -> String {
     )
 }
 
+fn record_schema() -> std::sync::Arc<Schema> {
+    std::sync::Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("kind", DataType::Utf8, false),
+        Field::new("scan", DataType::Utf8, false),
+        Field::new("len", DataType::UInt64, false),
+        Field::new("xxh3", DataType::UInt64, false),
+        Field::new("hash_key", DataType::UInt64, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]))
+}
+
+fn stored_record<T: Serialize>(
+    id: &str,
+    kind: &str,
+    scan: &str,
+    len: u64,
+    hash: &[u8],
+    payload: &T,
+) -> Result<StoredRecord> {
+    let xxh3 = match hash.len() {
+        0 => 0,
+        8 => u64::from_be_bytes(
+            hash.try_into()
+                .map_err(|_| "XXH3 hash must contain exactly 8 bytes")?,
+        ),
+        _ => return Err("XXH3 hash must contain exactly 8 bytes".into()),
+    };
+    let mut tuple_hasher = XxHash3_64::default();
+    tuple_hasher.write(&len.to_be_bytes());
+    tuple_hasher.write(hash);
+    Ok(StoredRecord {
+        id: id.to_owned(),
+        kind: kind.to_owned(),
+        scan: scan.to_owned(),
+        len,
+        xxh3,
+        hash_key: tuple_hasher.finish(),
+        payload: serde_json::to_string(payload)?,
+    })
+}
+
+fn decode_record<T: for<'de> Deserialize<'de>>(record: &StoredRecord) -> Result<T> {
+    Ok(serde_json::from_str(&record.payload)?)
+}
+
+fn record_batch(records: &[StoredRecord]) -> Result<RecordBatch> {
+    let schema = record_schema();
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![
+            std::sync::Arc::new(StringArray::from_iter_values(
+                records.iter().map(|record| record.id.as_str()),
+            )),
+            std::sync::Arc::new(StringArray::from_iter_values(
+                records.iter().map(|record| record.kind.as_str()),
+            )),
+            std::sync::Arc::new(StringArray::from_iter_values(
+                records.iter().map(|record| record.scan.as_str()),
+            )),
+            std::sync::Arc::new(UInt64Array::from_iter_values(
+                records.iter().map(|record| record.len),
+            )),
+            std::sync::Arc::new(UInt64Array::from_iter_values(
+                records.iter().map(|record| record.xxh3),
+            )),
+            std::sync::Arc::new(UInt64Array::from_iter_values(
+                records.iter().map(|record| record.hash_key),
+            )),
+            std::sync::Arc::new(StringArray::from_iter_values(
+                records.iter().map(|record| record.payload.as_str()),
+            )),
+        ],
+    )?)
+}
+
+async fn write_records(table: &Table, records: Vec<StoredRecord>) -> Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let mut unique_records = HashMap::with_capacity(records.len());
+    for record in records {
+        if let Some(existing) = unique_records.get(&record.id) {
+            if existing != &record {
+                return Err(
+                    format!("conflicting LanceDB rows share record id {}", record.id).into(),
+                );
+            }
+        } else {
+            unique_records.insert(record.id.clone(), record);
+        }
+    }
+    let records = unique_records.into_values().collect::<Vec<_>>();
+    let batch = record_batch(&records)?;
+    let schema = batch.schema();
+    let source = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut merge = table.merge_insert(&["id"]);
+    merge
+        .when_matched_update_all(None)
+        .when_not_matched_insert_all();
+    merge.execute(Box::new(source)).await?;
+    Ok(())
+}
+
+async fn load_records(table: &Table, kind: &str, scan: Option<&str>) -> Result<Vec<StoredRecord>> {
+    let predicate = match scan {
+        Some(scan) => format!(
+            "kind = '{}' AND scan = '{}'",
+            kind.replace('\'', "''"),
+            scan.replace('\'', "''")
+        ),
+        None => format!("kind = '{}'", kind.replace('\'', "''")),
+    };
+    let batches = table
+        .query()
+        .only_if(predicate)
+        .execute()
+        .await?
+        .try_collect::<Vec<RecordBatch>>()
+        .await?;
+    let mut records = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("invalid id column")?;
+        let kinds = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("invalid kind column")?;
+        let scans = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("invalid scan column")?;
+        let lens = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or("invalid len column")?;
+        let hashes = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or("invalid xxh3 column")?;
+        let hash_keys = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or("invalid hash_key column")?;
+        let payloads = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("invalid payload column")?;
+        for row in 0..batch.num_rows() {
+            records.push(StoredRecord {
+                id: ids.value(row).to_owned(),
+                kind: kinds.value(row).to_owned(),
+                scan: scans.value(row).to_owned(),
+                len: lens.value(row),
+                xxh3: hashes.value(row),
+                hash_key: hash_keys.value(row),
+                payload: payloads.value(row).to_owned(),
+            });
+        }
+    }
+    Ok(records)
+}
+
+async fn load_scan(table: &Table, scan_id: &str) -> Result<Scan> {
+    let record = load_records(table, "scan", Some(scan_id))
+        .await?
+        .into_iter()
+        .find(|record| record.id == scan_record_id(scan_id))
+        .ok_or("scan not found")?;
+    decode_record(&record)
+}
+
+async fn write_scan(table: &Table, scan: &Scan) -> Result<()> {
+    write_records(
+        table,
+        vec![stored_record(
+            &scan_record_id(scan.key()),
+            "scan",
+            scan.key(),
+            0,
+            &[],
+            scan,
+        )?],
+    )
+    .await
+}
+
+async fn open_store(path: &Path) -> Result<Table> {
+    let connection = lancedb::connect(&path.to_string_lossy()).execute().await?;
+    let names = connection.table_names().execute().await?;
+    if names.iter().any(|name| name == "records") {
+        return Ok(connection.open_table("records").execute().await?);
+    }
+    let table = connection
+        .create_empty_table("records", record_schema())
+        .execute()
+        .await?;
+    table
+        .create_index(&["hash_key"], Index::BTree(BTreeIndexBuilder::default()))
+        .execute()
+        .await?;
+    Ok(table)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
@@ -419,22 +620,7 @@ async fn main() -> Result<()> {
         return install();
     }
     let mut args = arguments.into_iter().skip(1);
-    let db: Surreal<Db> = Surreal::new::<surrealdb::engine::local::SurrealKv>(db_path).await?;
-    db.use_ns("btrfs_dup").use_db("index").await?;
-    db.query("DEFINE TABLE IF NOT EXISTS scan SCHEMALESS")
-        .await?;
-    db.query("DEFINE TABLE IF NOT EXISTS block SCHEMALESS")
-        .await?;
-    db.query("DEFINE TABLE IF NOT EXISTS scanned_file SCHEMALESS")
-        .await?;
-    db.query("DEFINE TABLE IF NOT EXISTS duplicate SCHEMALESS")
-        .await?;
-    db.query("DEFINE INDEX IF NOT EXISTS block_scan ON TABLE block FIELDS scan")
-        .await?;
-    db.query("DEFINE INDEX IF NOT EXISTS block_hash ON TABLE block FIELDS len, xxh3")
-        .await?;
-    db.query("DEFINE INDEX IF NOT EXISTS scanned_file_scan ON TABLE scanned_file FIELDS scan")
-        .await?;
+    let table = open_store(&db_path).await?;
     match command.to_string_lossy().as_ref() {
         "dedup" => {
             let remaining = args.collect::<Vec<_>>();
@@ -445,17 +631,11 @@ async fn main() -> Result<()> {
                     .cloned()
                     .ok_or("missing scan id after --resume")?;
                 let id = id.to_string_lossy().into_owned();
-                let mut scan: Scan = db
-                    .select(("scan", id.as_str()))
-                    .await?
-                    .ok_or("scan not found")?;
+                let mut scan = load_scan(&table, &id).await?;
                 scan.scan_id = Some(id.clone());
                 scan.state = "running".into();
-                let _: Option<Scan> = db
-                    .update(("scan", id.as_str()))
-                    .content(scan.clone())
-                    .await?;
-                return run_scan(&db, scan).await;
+                write_scan(&table, &scan).await?;
+                return run_scan(&table, scan).await;
             }
             let dry_run_flag = remaining.iter().any(|arg| arg == "--dry-run");
             let input = remaining
@@ -487,8 +667,8 @@ async fn main() -> Result<()> {
                 "Step 3/3: Starting {} scan.",
                 if dry_run { "dry-run" } else { "deduplication" }
             );
-            let scan = create_scan(&db, &source, dry_run).await?;
-            run_scan(&db, scan).await
+            let scan = create_scan(&table, &source, dry_run).await?;
+            run_scan(&table, scan).await
         }
         "resume" => {
             let id = args
@@ -496,21 +676,23 @@ async fn main() -> Result<()> {
                 .ok_or("usage: btrfs_dup resume <scan-id>")?
                 .to_string_lossy()
                 .into_owned();
-            let mut scan: Scan = db
-                .select(("scan", id.as_str()))
-                .await?
-                .ok_or("scan not found")?;
+            let mut scan = load_scan(&table, &id).await?;
             scan.scan_id = Some(id.clone());
             scan.state = "running".into();
-            let _: Option<Scan> = db
-                .update(("scan", id.as_str()))
-                .content(scan.clone())
-                .await?;
-            run_scan(&db, scan).await
+            write_scan(&table, &scan).await?;
+            run_scan(&table, scan).await
         }
         "list" => {
-            let scans: Vec<ScanListRow> = db.select("scan").await?;
-            let duplicates: Vec<Duplicate> = db.select("duplicate").await?;
+            let scans = load_records(&table, "scan", None)
+                .await?
+                .iter()
+                .map(decode_record::<Scan>)
+                .collect::<Result<Vec<_>>>()?;
+            let duplicates = load_records(&table, "duplicate", None)
+                .await?
+                .iter()
+                .map(decode_record::<Duplicate>)
+                .collect::<Result<Vec<_>>>()?;
             let mut duplicate_totals: HashMap<String, (u64, u64)> = HashMap::new();
             for duplicate in duplicates {
                 let totals = duplicate_totals.entry(duplicate.scan).or_default();
@@ -522,10 +704,7 @@ async fn main() -> Result<()> {
             let mut total_duplicates = 0;
             let mut total_duplicate_bytes = 0;
             for s in scans {
-                let id = s.scan_id.unwrap_or_else(|| match s.id.key {
-                    RecordIdKey::String(id) => id,
-                    key => format!("{key:?}"),
-                });
+                let id = s.key().to_owned();
                 let (duplicates, duplicate_bytes) =
                     duplicate_totals.get(&id).copied().unwrap_or_default();
                 total_files += s.files;
@@ -559,9 +738,7 @@ async fn main() -> Result<()> {
                 .ok_or("usage: btrfs_dup status <scan-id>")?
                 .to_string_lossy()
                 .into_owned();
-            let s: Option<Scan> = db.select(("scan", id.as_str())).await?;
-            let mut s = s.ok_or("scan not found")?;
-            s.scan_id = Some(id);
+            let s = load_scan(&table, &id).await?;
             println!("{s:#?}");
             Ok(())
         }
@@ -590,7 +767,7 @@ fn take_db_path(arguments: &mut Vec<std::ffi::OsString>) -> Result<PathBuf> {
             index += 1;
         }
     }
-    Ok(db_path.unwrap_or_else(|| PathBuf::from("btrfs-dup.db")))
+    Ok(db_path.unwrap_or_else(|| PathBuf::from("btrfs-dup.lance")))
 }
 
 fn install() -> Result<()> {
@@ -849,7 +1026,7 @@ fn choose_mount(mut candidates: Vec<PathBuf>, device: &Path) -> Result<PathBuf> 
         .ok_or_else(|| "invalid choice".into())
 }
 
-async fn create_scan(db: &Surreal<Db>, source: &Path, dry_run: bool) -> Result<Scan> {
+async fn create_scan(table: &Table, source: &Path, dry_run: bool) -> Result<Scan> {
     let source = fs::canonicalize(source)?;
     let source_fd = File::open(&source)?;
     let snapshot_parent = source.join(SNAPSHOT_DIR);
@@ -873,14 +1050,11 @@ async fn create_scan(db: &Surreal<Db>, source: &Path, dry_run: bool) -> Result<S
         files: 0,
         blocks: 0,
     };
-    let _: Option<Scan> = db
-        .create(("scan", id.as_str()))
-        .content(scan.clone())
-        .await?;
+    write_scan(table, &scan).await?;
     Ok(scan)
 }
 
-async fn run_scan(db: &Surreal<Db>, mut scan: Scan) -> Result<()> {
+async fn run_scan(table: &Table, mut scan: Scan) -> Result<()> {
     let snapshot = PathBuf::from(&scan.snapshot);
     let source = PathBuf::from(&scan.source);
     println!("Counting files and planned blocks in the snapshot...");
@@ -897,23 +1071,23 @@ async fn run_scan(db: &Surreal<Db>, mut scan: Scan) -> Result<()> {
     let mut buckets: HashMap<(usize, u64), Vec<(PathBuf, u64, Option<Vec<u8>>)>> = HashMap::new();
     // Rebuild the in-memory candidate map from persisted block rows on resume;
     // this also makes repeated indexing safe through deterministic record IDs.
-    let prior: Vec<Block> = db
-        .query("SELECT * FROM block WHERE scan = $id")
-        .bind(("id", scan.key().to_owned()))
+    let prior = load_records(table, "block", Some(scan.key()))
         .await?
-        .take(0)?;
+        .iter()
+        .map(decode_record::<Block>)
+        .collect::<Result<Vec<_>>>()?;
     let mut batch = WriteBatch::new();
     scan.blocks = prior.len() as u64;
-    let prior_files: Vec<ScannedFile> = db
-        .query("SELECT * FROM scanned_file WHERE scan = $id")
-        .bind(("id", scan.key().to_owned()))
+    let prior_files = load_records(table, "file", Some(scan.key()))
         .await?
-        .take(0)?;
+        .iter()
+        .map(decode_record::<ScannedFile>)
+        .collect::<Result<Vec<_>>>()?;
     let mut completed_paths = HashSet::new();
     let mut completed_bytes = 0;
     let mut completed_blocks = 0;
     for file in &prior_files {
-        let path_bytes = file.path.to_vec();
+        let path_bytes = file.path.clone();
         let relative = PathBuf::from(std::ffi::OsString::from_vec(path_bytes.clone()));
         let size = if file.bytes > 0 {
             file.bytes
@@ -933,29 +1107,24 @@ async fn run_scan(db: &Surreal<Db>, mut scan: Scan) -> Result<()> {
     }
     scan.files = completed_paths.len() as u64;
     for b in prior {
-        let xxh3 = u64::from_be_bytes(
-            b.xxh3
-                .as_ref()
-                .try_into()
-                .map_err(|_| "stored XXH3 hash must contain exactly 8 bytes")?,
-        );
-        let relative = PathBuf::from(std::ffi::OsString::from_vec(b.path.to_vec()));
+        let xxh3 = b.xxh3;
+        let relative = PathBuf::from(std::ffi::OsString::from_vec(b.path.clone()));
         let absolute = snapshot.join(&relative);
         if b.blake3.is_none() {
-            let block_key = block_id(scan.key(), b.path.as_ref(), b.offset);
+            let block_key = block_id(scan.key(), &b.path, b.offset);
             batch.collision_candidates.insert(block_key, b.clone());
         }
-        buckets.entry((b.len, xxh3)).or_default().push((
-            absolute,
-            b.offset,
-            b.blake3.map(|digest| digest.to_vec()),
-        ));
+        buckets
+            .entry((b.len, xxh3))
+            .or_default()
+            .push((absolute, b.offset, b.blake3.clone()));
     }
-    let prior_duplicates: Vec<Duplicate> = db
-        .query("SELECT * FROM duplicate WHERE scan = $id")
-        .bind(("id", scan.key().to_owned()))
+    let prior_duplicates = load_records(table, "duplicate", Some(scan.key()))
         .await?
-        .take(0)?;
+        .iter()
+        .map(decode_record::<Duplicate>)
+        .collect::<Result<Vec<_>>>()
+        .map_err(|error| error.to_string())?;
     let duplicate_count = prior_duplicates.len() as u64;
     let duplicate_bytes = prior_duplicates.iter().map(|duplicate| duplicate.len).sum();
     println!(
@@ -982,7 +1151,7 @@ async fn run_scan(db: &Surreal<Db>, mut scan: Scan) -> Result<()> {
         .filter(|(_, relative)| !completed_paths.contains(&path_bytes(relative)))
         .collect();
     scan_files_parallel(
-        db,
+        table,
         &source,
         &mut scan,
         &mut buckets,
@@ -992,13 +1161,10 @@ async fn run_scan(db: &Surreal<Db>, mut scan: Scan) -> Result<()> {
         pending_files,
     )
     .await?;
-    batch.flush(db, &scan).await?;
+    batch.flush(table, &scan).await?;
     progress.draw(true)?;
     scan.state = "complete".into();
-    let _: Option<Scan> = db
-        .update(("scan", scan.key()))
-        .content(scan.clone())
-        .await?;
+    write_scan(table, &scan).await?;
     Ok(())
 }
 
@@ -1049,7 +1215,7 @@ fn blocks_for_size(size: u64) -> u64 {
 }
 
 async fn scan_files_parallel(
-    db: &Surreal<Db>,
+    table: &Table,
     source: &Path,
     scan: &mut Scan,
     buckets: &mut HashMap<(usize, u64), Vec<(PathBuf, u64, Option<Vec<u8>>)>>,
@@ -1078,7 +1244,7 @@ async fn scan_files_parallel(
                 .drain(..jobs.len().min(HASH_WORKER_BATCH_FILES))
                 .collect::<Vec<_>>();
             let bytes_read = Arc::clone(&bytes_read);
-            let worker_db = db.clone();
+            let worker_table = table.clone();
             let scan_id = scan.key().to_owned();
             workers.spawn(async move {
                 let hashed_files = tokio::task::spawn_blocking(move || {
@@ -1090,7 +1256,7 @@ async fn scan_files_parallel(
                 .await
                 .map_err(|error| error.to_string())?
                 .map_err(|error| error.to_string())?;
-                persist_hashed_blocks(&worker_db, &scan_id, &hashed_files).await?;
+                persist_hashed_blocks(&worker_table, &scan_id, &hashed_files).await?;
                 Ok::<_, String>(hashed_files)
             });
         }
@@ -1104,7 +1270,7 @@ async fn scan_files_parallel(
                 for hashed in hashed_files {
                     let writable = source.join(&hashed.relative);
                     let relative_bytes = path_bytes(&hashed.relative);
-                    let file_key = block_id(scan.key(), &relative_bytes, 0);
+                    let file_key = file_id(scan.key(), &relative_bytes);
                     let blocks_before = progress.blocks;
                     index_hashed_file(scan, &hashed, &writable, buckets, progress, batch)?;
                     progress.files += 1;
@@ -1112,14 +1278,14 @@ async fn scan_files_parallel(
                     scan.blocks = progress.blocks;
                     batch.files.insert(file_key, ScannedFile {
                         scan: scan.key().to_owned(),
-                        path: Bytes::from(relative_bytes.clone()),
+                        path: relative_bytes.clone(),
                         bytes: hashed.size,
                         blocks: progress.blocks - blocks_before,
                     });
                     completed_paths.insert(relative_bytes);
                     progress.draw(false)?;
                     if batch.last_flush.elapsed() >= Duration::from_secs(30) {
-                        batch.flush(db, scan).await?;
+                        batch.flush(table, scan).await?;
                     }
                 }
             }
@@ -1134,7 +1300,7 @@ async fn scan_files_parallel(
 }
 
 async fn persist_hashed_blocks(
-    db: &Surreal<Db>,
+    table: &Table,
     scan_id: &str,
     files: &[HashedFile],
 ) -> std::result::Result<(), String> {
@@ -1144,36 +1310,28 @@ async fn persist_hashed_blocks(
             let path = path_bytes(&file.relative);
             file.blocks.iter().map(move |block| {
                 let id = block_id(scan_id, &path, block.offset);
-                BatchRecord {
-                    id,
-                    content: Block {
+                stored_record(
+                    &id,
+                    "block",
+                    scan_id,
+                    block.len as u64,
+                    &block.xxh3.to_be_bytes(),
+                    &Block {
                         scan: scan_id.to_owned(),
-                        xxh3: Bytes::from(block.xxh3.to_be_bytes().to_vec()),
+                        xxh3: block.xxh3,
                         len: block.len,
-                        path: Bytes::from(path.clone()),
+                        path: path.clone(),
                         offset: block.offset,
                         blake3: None,
-                    }
-                    .into_value(),
-                }
+                    },
+                )
             })
         })
-        .collect::<Vec<_>>()
-        .into_value();
-    let db = db.clone();
-    tokio::task::spawn_blocking(move || {
-        tokio::runtime::Handle::current().block_on(async move {
-            db.query(
-                "FOR $item IN $blocks { UPSERT type::record('block', $item.id) CONTENT $item.content; };",
-            )
-            .bind(("blocks", records))
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-        })
-    })
-    .await
-    .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>>>()
+        .map_err(|error| error.to_string())?;
+    write_records(table, records)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 fn hash_file(
@@ -1251,7 +1409,7 @@ fn index_hashed_file(
                     let old_id =
                         block_id(scan.key(), path_bytes(old_relative).as_slice(), member.1);
                     if let Some(old_record) = batch.blocks.get_mut(&old_id) {
-                        old_record.blake3 = Some(Bytes::from(old_digest));
+                        old_record.blake3 = Some(old_digest);
                         batch.collision_candidates.remove(&old_id);
                     } else {
                         let old_record = batch
@@ -1261,7 +1419,7 @@ fn index_hashed_file(
                         batch.blocks.insert(
                             old_id,
                             Block {
-                                blake3: Some(Bytes::from(old_digest)),
+                                blake3: Some(old_digest),
                                 ..old_record
                             },
                         );
@@ -1274,11 +1432,11 @@ fn index_hashed_file(
         let record_id = block_id(scan.key(), &raw_path, offset);
         let block = Block {
             scan: scan.key().to_owned(),
-            xxh3: Bytes::from(xxh3.to_be_bytes().to_vec()),
+            xxh3,
             len,
-            path: Bytes::from(raw_path),
+            path: raw_path,
             offset,
-            blake3: strong.clone().map(Bytes::from),
+            blake3: strong.clone(),
         };
         if strong.is_some() {
             batch.blocks.insert(record_id, block);
@@ -1332,14 +1490,14 @@ fn index_hashed_file(
                     dedupe_live_ranges(writable, offset, &candidate_live, *candidate_offset, len)?
                 };
                 let duplicate_path = path_bytes(&file.relative);
-                let duplicate_id = block_id(scan.key(), &duplicate_path, offset);
+                let duplicate_id = duplicate_id(scan.key(), &duplicate_path, offset);
                 batch.duplicates.insert(
                     duplicate_id,
                     Duplicate {
                         scan: scan.key().to_owned(),
-                        duplicate_path: Bytes::from(duplicate_path),
+                        duplicate_path,
                         duplicate_offset: offset,
-                        source_path: Bytes::from(path_bytes(relative)),
+                        source_path: path_bytes(relative),
                         source_offset: *candidate_offset,
                         len: len as u64,
                         deduped_bytes,
@@ -1364,6 +1522,22 @@ fn hash_range(path: &Path, offset: u64, len: usize) -> Result<Vec<u8>> {
 }
 
 fn block_id(scan_id: &str, path: &[u8], offset: u64) -> String {
+    format!("block:{}", location_id(scan_id, path, offset))
+}
+
+fn file_id(scan_id: &str, path: &[u8]) -> String {
+    format!("file:{}", location_id(scan_id, path, 0))
+}
+
+fn duplicate_id(scan_id: &str, path: &[u8], offset: u64) -> String {
+    format!("duplicate:{}", location_id(scan_id, path, offset))
+}
+
+fn scan_record_id(scan_id: &str) -> String {
+    format!("scan:{scan_id}")
+}
+
+fn location_id(scan_id: &str, path: &[u8], offset: u64) -> String {
     let mut identity = Vec::with_capacity(scan_id.len() + path.len() + 16);
     identity.extend_from_slice(&(scan_id.len() as u64).to_be_bytes());
     identity.extend_from_slice(scan_id.as_bytes());
@@ -1457,6 +1631,31 @@ mod tests {
         assert_eq!(arguments, vec!["list"]);
     }
 
+    #[test]
+    fn block_index_key_is_u64_hash_of_length_and_xxh3_tuple() {
+        let length = 4096u64;
+        let hash = 0x0102_0304_0506_0708u64.to_be_bytes();
+        let record = stored_record("id", "block", "scan", length, &hash, &"payload")
+            .expect("serialize block row");
+
+        let mut expected = XxHash3_64::default();
+        expected.write(&length.to_be_bytes());
+        expected.write(&hash);
+        assert_eq!(record.hash_key, expected.finish());
+        assert_eq!(record.xxh3, u64::from_be_bytes(hash));
+    }
+
+    #[test]
+    fn unified_table_record_ids_are_namespaced_by_kind() {
+        let block = block_id("scan", b"file", 0);
+        let file = file_id("scan", b"file");
+        let duplicate = duplicate_id("scan", b"file", 0);
+
+        assert_ne!(block, file);
+        assert_ne!(block, duplicate);
+        assert_ne!(file, duplicate);
+    }
+
     #[tokio::test]
     async fn write_batch_flushes_stable_record_ids() {
         let path = std::env::temp_dir().join(format!(
@@ -1467,13 +1666,9 @@ mod tests {
                 .expect("system clock")
                 .as_nanos()
         ));
-        let db: Surreal<Db> = Surreal::new::<surrealdb::engine::local::SurrealKv>(path.clone())
+        let table = open_store(&path)
             .await
-            .expect("open temporary database");
-        db.use_ns("test")
-            .use_db("batch")
-            .await
-            .expect("select test database");
+            .expect("open temporary LanceDB table");
         let scan = Scan {
             scan_id: Some("scan-1".into()),
             source: "/source".into(),
@@ -1488,9 +1683,9 @@ mod tests {
             "block-1".into(),
             Block {
                 scan: "scan-1".into(),
-                xxh3: Bytes::from(1u64.to_be_bytes().to_vec()),
+                xxh3: 1,
                 len: 4096,
-                path: Bytes::from(b"file".to_vec()),
+                path: b"file".to_vec(),
                 offset: 0,
                 blake3: None,
             },
@@ -1499,17 +1694,16 @@ mod tests {
             "file-1".into(),
             ScannedFile {
                 scan: "scan-1".into(),
-                path: Bytes::from(b"file".to_vec()),
+                path: b"file".to_vec(),
                 bytes: 4096,
                 blocks: 1,
             },
         );
-        batch.flush(&db, &scan).await.expect("flush batch");
-        let block: Option<Block> = db
-            .select(("block", "block-1"))
+        batch.flush(&table, &scan).await.expect("flush batch");
+        let blocks = load_records(&table, "block", Some("scan-1"))
             .await
-            .expect("select flushed block");
-        assert!(block.is_some());
+            .expect("load persisted blocks");
+        assert!(blocks.iter().any(|row| row.id == "block-1"));
         let hashed = [HashedFile {
             path: PathBuf::from("/snapshot/worker-file"),
             relative: PathBuf::from("worker-file"),
@@ -1520,16 +1714,23 @@ mod tests {
                 xxh3: 2,
             }],
         }];
-        persist_hashed_blocks(&db, "scan-1", &hashed)
+        persist_hashed_blocks(&table, "scan-1", &hashed)
             .await
             .expect("persist worker block batch");
         let worker_block_id = block_id("scan-1", b"worker-file", 0);
-        let worker_block: Option<Block> = db
-            .select(("block", worker_block_id.as_str()))
+        let worker_block = load_records(&table, "block", Some("scan-1"))
             .await
-            .expect("select worker block");
-        assert_eq!(worker_block.expect("worker row exists").len, 4096);
-        drop(db);
+            .expect("load worker block")
+            .into_iter()
+            .find(|row| row.id == worker_block_id)
+            .expect("worker row exists");
+        assert_eq!(
+            decode_record::<Block>(&worker_block)
+                .expect("decode block")
+                .len,
+            4096
+        );
+        drop(table);
         let _ = fs::remove_dir_all(path);
     }
 
