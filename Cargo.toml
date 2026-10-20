@@ -1,0 +1,17 @@
+[package]
+name = "btrfs-dup"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+surrealdb = { version = "3.3", default-features = false, features = ["kv-surrealkv"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+twox-hash = "2.1"
+btrfs-uapi = "0.13.0"
+
+[profile.release]
+opt-level = 3
+debug = 2
+strip = "none"
