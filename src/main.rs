@@ -761,6 +761,14 @@ fn take_db_path(arguments: &mut Vec<std::ffi::OsString>) -> Result<PathBuf> {
             if index + 1 >= arguments.len() {
                 return Err("--db requires a path".into());
             }
+            if matches!(
+                arguments[index + 1].to_string_lossy().as_ref(),
+                "dedup" | "list" | "resume" | "status" | "install"
+            ) {
+                return Err(
+                    "--db is missing its path; use 'btrfs-dup list' for the default database, or 'btrfs-dup --db <path> list'".into(),
+                );
+            }
             db_path = Some(PathBuf::from(arguments.remove(index + 1)));
             arguments.remove(index);
         } else {
@@ -1059,7 +1067,8 @@ async fn run_scan(table: &Table, mut scan: Scan) -> Result<()> {
     let source = PathBuf::from(&scan.source);
     println!("Counting files and planned blocks in the snapshot...");
     let mut inventory = Inventory::default();
-    let source_mount_id = mount_id(&source)?;
+    let source_mount_id =
+        mount_id(&source)?.ok_or("selected source disappeared before inventory")?;
     inventory_directory(
         &snapshot,
         &snapshot,
@@ -1193,7 +1202,10 @@ fn inventory_directory(
         }
         let relative = path.strip_prefix(root)?;
         let source_path = source_root.join(relative);
-        if mount_id(&source_path)? != source_mount_id {
+        let Some(path_mount_id) = mount_id(&source_path)? else {
+            continue;
+        };
+        if path_mount_id != source_mount_id {
             continue;
         }
         if metadata.is_dir() {
@@ -1220,7 +1232,7 @@ fn inventory_directory(
     Ok(())
 }
 
-fn mount_id(path: &Path) -> Result<u64> {
+fn mount_id(path: &Path) -> Result<Option<u64>> {
     let path = CString::new(path.as_os_str().as_bytes())?;
     let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
     let result = unsafe {
@@ -1233,7 +1245,11 @@ fn mount_id(path: &Path) -> Result<u64> {
         )
     };
     if result != 0 {
-        return Err(std::io::Error::last_os_error().into());
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(error.into());
     }
     let stat = unsafe { stat.assume_init() };
     if stat.stx_mask & libc::STATX_MNT_ID == 0 {
@@ -1243,7 +1259,7 @@ fn mount_id(path: &Path) -> Result<u64> {
         )
         .into());
     }
-    Ok(stat.stx_mnt_id)
+    Ok(Some(stat.stx_mnt_id))
 }
 
 fn blocks_for_size(size: u64) -> u64 {
@@ -1665,7 +1681,25 @@ mod tests {
 
     #[test]
     fn statx_returns_mount_id_for_root() {
-        assert_ne!(mount_id(Path::new("/")).expect("stat root mount ID"), 0);
+        assert_ne!(
+            mount_id(Path::new("/"))
+                .expect("stat root mount ID")
+                .expect("root exists"),
+            0
+        );
+    }
+
+    #[test]
+    fn statx_skips_snapshot_paths_missing_from_live_source() {
+        let missing = std::env::temp_dir().join(format!(
+            "btrfs-dup-missing-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        assert_eq!(mount_id(&missing).expect("stat missing path"), None);
     }
 
     #[test]
@@ -1676,6 +1710,13 @@ mod tests {
 
         assert_eq!(path, PathBuf::from("/var/lib/btrfs-dup"));
         assert_eq!(arguments, vec!["list"]);
+    }
+
+    #[test]
+    fn database_option_does_not_consume_command_as_its_path() {
+        let mut arguments = vec!["--db".into(), "list".into()];
+
+        assert!(take_db_path(&mut arguments).is_err());
     }
 
     #[test]
