@@ -1059,7 +1059,14 @@ async fn run_scan(table: &Table, mut scan: Scan) -> Result<()> {
     let source = PathBuf::from(&scan.source);
     println!("Counting files and planned blocks in the snapshot...");
     let mut inventory = Inventory::default();
-    inventory_directory(&snapshot, &snapshot, &mut inventory)?;
+    let source_mount_id = mount_id(&source)?;
+    inventory_directory(
+        &snapshot,
+        &snapshot,
+        &source,
+        source_mount_id,
+        &mut inventory,
+    )?;
     if io::stderr().is_terminal() && inventory.last_draw.is_some() {
         eprintln!();
     }
@@ -1168,7 +1175,13 @@ async fn run_scan(table: &Table, mut scan: Scan) -> Result<()> {
     Ok(())
 }
 
-fn inventory_directory(root: &Path, dir: &Path, inventory: &mut Inventory) -> Result<()> {
+fn inventory_directory(
+    root: &Path,
+    dir: &Path,
+    source_root: &Path,
+    source_mount_id: u64,
+    inventory: &mut Inventory,
+) -> Result<()> {
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
         if dir == root && path.file_name() == Some(std::ffi::OsStr::new(SNAPSHOT_DIR)) {
@@ -1179,7 +1192,12 @@ fn inventory_directory(root: &Path, dir: &Path, inventory: &mut Inventory) -> Re
             continue;
         }
         if metadata.is_dir() {
-            inventory_directory(root, &path, inventory)?;
+            let relative = path.strip_prefix(root)?;
+            let source_path = source_root.join(relative);
+            if mount_id(&source_path)? != source_mount_id {
+                continue;
+            }
+            inventory_directory(root, &path, source_root, source_mount_id, inventory)?;
         } else if metadata.is_file() {
             inventory.files += 1;
             inventory.bytes += metadata.len();
@@ -1202,6 +1220,32 @@ fn inventory_directory(root: &Path, dir: &Path, inventory: &mut Inventory) -> Re
         }
     }
     Ok(())
+}
+
+fn mount_id(path: &Path) -> Result<u64> {
+    let path = CString::new(path.as_os_str().as_bytes())?;
+    let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    let result = unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::AT_STATX_SYNC_AS_STAT,
+            libc::STATX_MNT_ID,
+            stat.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let stat = unsafe { stat.assume_init() };
+    if stat.stx_mask & libc::STATX_MNT_ID == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "kernel did not return a mount ID for statx",
+        )
+        .into());
+    }
+    Ok(stat.stx_mnt_id)
 }
 
 fn blocks_for_size(size: u64) -> u64 {
@@ -1619,6 +1663,11 @@ mod tests {
 
         assert_eq!(deepest.target, Path::new("/e"));
         assert_ne!(deepest.fs_type, "btrfs");
+    }
+
+    #[test]
+    fn statx_returns_mount_id_for_root() {
+        assert_ne!(mount_id(Path::new("/")).expect("stat root mount ID"), 0);
     }
 
     #[test]

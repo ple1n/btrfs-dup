@@ -30,7 +30,10 @@ With no command or with `dedup` and no path, the guided flow asks for a mounted
 path or `/dev/...` device. A device is matched to its mounted Btrfs path; if
 there are multiple matching mounts, the user chooses one. A directory inside
 a Btrfs mount resolves to its mount root, and the scan covers that mounted
-subvolume. The guided flow defaults to a dry run and asks for a second
+subvolume. Before descending into each snapshot directory, the scanner checks
+the live source path's Linux mount ID against the selected root mount, avoiding
+descendant mount points even when they share a device number. The guided flow
+defaults to a dry run and asks for a second
 confirmation before allowing dedupe changes. `--dry-run` selects dry-run mode
 without the prompt.
 

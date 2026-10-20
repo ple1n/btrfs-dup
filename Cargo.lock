@@ -598,6 +598,7 @@ dependencies = [
  "btrfs-uapi",
  "futures",
  "lancedb",
+ "libc",
  "serde",
  "serde_json",
  "tokio",
