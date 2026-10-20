@@ -35,6 +35,7 @@ const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 const TEN_MIB: usize = 10 * 1024 * 1024;
 const HUNDRED_MIB: usize = 100 * 1024 * 1024;
+const HASH_WORKER_BATCH_FILES: usize = 256;
 const SNAPSHOT_DIR: &str = ".btrfs-dup-snapshots";
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -171,8 +172,12 @@ impl WriteBatch {
             })
             .collect::<Vec<_>>()
             .into_value();
-        let request = db
-            .query(
+        let db = db.clone();
+        let scan_id = scan.key().to_owned();
+        let scan = scan.clone().into_value();
+        let write = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                db.query(
                 "FOR $item IN $blocks { UPSERT type::record('block', $item.id) CONTENT $item.content; };
                  FOR $item IN $files { UPSERT type::record('scanned_file', $item.id) CONTENT $item.content; };
                  FOR $item IN $duplicates { UPSERT type::record('duplicate', $item.id) CONTENT $item.content; };
@@ -181,9 +186,16 @@ impl WriteBatch {
             .bind(("blocks", block_records))
             .bind(("files", file_records))
             .bind(("duplicates", duplicate_records))
-            .bind(("scan_id", scan.key().to_owned()))
-            .bind(("scan", scan.clone().into_value()));
-        if let Err(error) = request.await {
+            .bind(("scan_id", scan_id))
+            .bind(("scan", scan))
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+            })
+        })
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+        if let Err(error) = write {
             self.blocks.extend(blocks);
             self.files.extend(files);
             self.duplicates.extend(duplicates);
@@ -234,7 +246,7 @@ struct ScanProgress {
     last_draw: Instant,
     started_at: Instant,
     last_rate_sample_at: Instant,
-    last_rate_sample_bytes: u64,
+    rate_samples: VecDeque<(Instant, u64)>,
     bytes_per_second: f64,
     panel_drawn: bool,
 }
@@ -261,7 +273,7 @@ impl ScanProgress {
             last_draw: now - Duration::from_secs(1),
             started_at: now,
             last_rate_sample_at: now,
-            last_rate_sample_bytes: completed_bytes,
+            rate_samples: VecDeque::from([(now, completed_bytes)]),
             bytes_per_second: 0.0,
             panel_drawn: false,
         }
@@ -271,15 +283,23 @@ impl ScanProgress {
         let now = Instant::now();
         let sample_elapsed = now.duration_since(self.last_rate_sample_at).as_secs_f64();
         if sample_elapsed >= 0.5 {
-            let bytes_since_sample = self.bytes.saturating_sub(self.last_rate_sample_bytes);
-            let instantaneous_rate = bytes_since_sample as f64 / sample_elapsed;
-            self.bytes_per_second = if self.bytes_per_second == 0.0 {
-                instantaneous_rate
-            } else {
-                self.bytes_per_second * 0.7 + instantaneous_rate * 0.3
-            };
             self.last_rate_sample_at = now;
-            self.last_rate_sample_bytes = self.bytes;
+            self.rate_samples.push_back((now, self.bytes));
+            while self
+                .rate_samples
+                .front()
+                .is_some_and(|(at, _)| now.duration_since(*at) > Duration::from_secs(5))
+                && self.rate_samples.len() > 1
+            {
+                self.rate_samples.pop_front();
+            }
+            if let Some((start_at, start_bytes)) = self.rate_samples.front() {
+                let elapsed = now.duration_since(*start_at).as_secs_f64();
+                if elapsed > 0.0 {
+                    self.bytes_per_second =
+                        self.bytes.saturating_sub(*start_bytes) as f64 / elapsed;
+                }
+            }
         }
         if !force && self.last_draw.elapsed() < Duration::from_millis(150) {
             return Ok(());
@@ -300,7 +320,7 @@ impl ScanProgress {
         let lines = [
             format!("Scan [{bar}] {percent:3}%"),
             format!(
-                "Bytes: {} / {} scanned | {} remaining | {} | elapsed {elapsed}",
+                "Bytes read: {} / {} | {} remaining | read rate {} | elapsed {elapsed}",
                 format_bytes(self.bytes),
                 format_bytes(self.total_bytes),
                 format_bytes(remaining_bytes),
@@ -728,18 +748,31 @@ fn resolve_btrfs_mount(input: &Path) -> Result<PathBuf> {
         return choose_mount(candidates, &input);
     }
 
-    mounts
-        .iter()
-        .filter(|m| m.fs_type == "btrfs" && input.starts_with(&m.target))
-        .max_by_key(|m| m.target.components().count())
-        .map(|m| m.target.clone())
-        .ok_or_else(|| format!("{} is not on a mounted Btrfs filesystem", input.display()).into())
+    let mount = deepest_mount_for_path(&input, &mounts)
+        .ok_or_else(|| format!("{} is not on a mounted filesystem", input.display()))?;
+    if mount.fs_type != "btrfs" {
+        return Err(format!(
+            "{} is on {} filesystem mounted at {}, not Btrfs",
+            input.display(),
+            mount.fs_type,
+            mount.target.display()
+        )
+        .into());
+    }
+    Ok(mount.target.clone())
 }
 
 struct Mount {
     source: PathBuf,
     target: PathBuf,
     fs_type: String,
+}
+
+fn deepest_mount_for_path<'a>(input: &Path, mounts: &'a [Mount]) -> Option<&'a Mount> {
+    mounts
+        .iter()
+        .filter(|mount| input.starts_with(&mount.target))
+        .max_by_key(|mount| mount.target.components().count())
 }
 
 fn read_mounts() -> Result<Vec<Mount>> {
@@ -800,10 +833,7 @@ async fn create_scan(db: &Surreal<Db>, source: &Path, dry_run: bool) -> Result<S
     let source_fd = File::open(&source)?;
     let snapshot_parent = source.join(SNAPSHOT_DIR);
     fs::create_dir_all(&snapshot_parent)?;
-    let base = source
-        .file_name()
-        .ok_or("source has no name")?
-        .to_string_lossy();
+    let base = source_label(&source);
     let id = format!(
         "{}-{}",
         base,
@@ -1023,7 +1053,9 @@ async fn scan_files_parallel(
             if jobs.is_empty() {
                 break;
             }
-            let worker_jobs = jobs.drain(..jobs.len().min(16)).collect::<Vec<_>>();
+            let worker_jobs = jobs
+                .drain(..jobs.len().min(HASH_WORKER_BATCH_FILES))
+                .collect::<Vec<_>>();
             let bytes_read = Arc::clone(&bytes_read);
             let worker_db = db.clone();
             let scan_id = scan.key().to_owned();
@@ -1107,13 +1139,20 @@ async fn persist_hashed_blocks(
         })
         .collect::<Vec<_>>()
         .into_value();
-    db.query(
-        "FOR $item IN $blocks { UPSERT type::record('block', $item.id) CONTENT $item.content; };",
-    )
-    .bind(("blocks", records))
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || {
+        tokio::runtime::Handle::current().block_on(async move {
+            db.query(
+                "FOR $item IN $blocks { UPSERT type::record('block', $item.id) CONTENT $item.content; };",
+            )
+            .bind(("blocks", records))
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+        })
+    })
     .await
-    .map(|_| ())
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?
 }
 
 fn hash_file(
@@ -1313,6 +1352,14 @@ fn block_id(scan_id: &str, path: &[u8], offset: u64) -> String {
     blake3::hash(&identity).to_hex().to_string()
 }
 
+fn source_label(source: &Path) -> String {
+    source
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("root"))
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn dedupe_live_ranges(
     source_path: &Path,
     source_offset: u64,
@@ -1350,6 +1397,34 @@ trait SeekTo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_source_has_a_snapshot_label() {
+        assert_eq!(source_label(Path::new("/")), "root");
+        assert_eq!(source_label(Path::new("/mnt/data")), "data");
+    }
+
+    #[test]
+    fn path_on_nested_non_btrfs_mount_is_not_resolved_to_parent_btrfs() {
+        let mounts = [
+            Mount {
+                source: PathBuf::from("/dev/btrfs"),
+                target: PathBuf::from("/"),
+                fs_type: "btrfs".into(),
+            },
+            Mount {
+                source: PathBuf::from("/dev/ext4"),
+                target: PathBuf::from("/e"),
+                fs_type: "ext4".into(),
+            },
+        ];
+
+        let deepest = deepest_mount_for_path(Path::new("/e"), &mounts)
+            .expect("nested mount should be selected");
+
+        assert_eq!(deepest.target, Path::new("/e"));
+        assert_ne!(deepest.fs_type, "btrfs");
+    }
 
     #[tokio::test]
     async fn write_batch_flushes_stable_record_ids() {
