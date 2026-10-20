@@ -1191,20 +1191,18 @@ fn inventory_directory(
         if metadata.file_type().is_symlink() {
             continue;
         }
+        let relative = path.strip_prefix(root)?;
+        let source_path = source_root.join(relative);
+        if mount_id(&source_path)? != source_mount_id {
+            continue;
+        }
         if metadata.is_dir() {
-            let relative = path.strip_prefix(root)?;
-            let source_path = source_root.join(relative);
-            if mount_id(&source_path)? != source_mount_id {
-                continue;
-            }
             inventory_directory(root, &path, source_root, source_mount_id, inventory)?;
         } else if metadata.is_file() {
             inventory.files += 1;
             inventory.bytes += metadata.len();
             inventory.blocks += blocks_for_size(metadata.len());
-            inventory
-                .paths
-                .push((path.clone(), path.strip_prefix(root)?.to_path_buf()));
+            inventory.paths.push((path.clone(), relative.to_path_buf()));
             if io::stderr().is_terminal()
                 && inventory
                     .last_draw
@@ -1229,7 +1227,7 @@ fn mount_id(path: &Path) -> Result<u64> {
         libc::statx(
             libc::AT_FDCWD,
             path.as_ptr(),
-            libc::AT_STATX_SYNC_AS_STAT,
+            libc::AT_STATX_SYNC_AS_STAT | libc::AT_SYMLINK_NOFOLLOW,
             libc::STATX_MNT_ID,
             stat.as_mut_ptr(),
         )
