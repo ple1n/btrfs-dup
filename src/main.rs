@@ -409,16 +409,17 @@ fn format_duration(duration: Duration) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut args = std::env::args_os().skip(1);
-    let command = args.next().unwrap_or_else(|| "dedup".into());
+    let mut arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let db_path = take_db_path(&mut arguments)?;
+    let command = arguments.first().cloned().unwrap_or_else(|| "dedup".into());
     if command == "install" {
-        if args.next().is_some() {
+        if arguments.len() > 1 {
             return Err("usage: btrfs-dup install".into());
         }
         return install();
     }
-    let db: Surreal<Db> =
-        Surreal::new::<surrealdb::engine::local::SurrealKv>("btrfs-dup.db").await?;
+    let mut args = arguments.into_iter().skip(1);
+    let db: Surreal<Db> = Surreal::new::<surrealdb::engine::local::SurrealKv>(db_path).await?;
     db.use_ns("btrfs_dup").use_db("index").await?;
     db.query("DEFINE TABLE IF NOT EXISTS scan SCHEMALESS")
         .await?;
@@ -569,7 +570,27 @@ async fn main() -> Result<()> {
 }
 
 fn usage<T>() -> Result<T> {
-    Err("usage: btrfs-dup [dedup [<mount-path|/dev/device>] [--dry-run] | dedup --resume <scan-id> | list | status <scan-id> | resume <scan-id> | install]".into())
+    Err("usage: btrfs-dup [--db <path>] [dedup [<mount-path|/dev/device>] [--dry-run] | dedup --resume <scan-id> | list | status <scan-id> | resume <scan-id> | install]".into())
+}
+
+fn take_db_path(arguments: &mut Vec<std::ffi::OsString>) -> Result<PathBuf> {
+    let mut db_path = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        if arguments[index] == "--db" {
+            if db_path.is_some() {
+                return Err("--db may be specified only once".into());
+            }
+            if index + 1 >= arguments.len() {
+                return Err("--db requires a path".into());
+            }
+            db_path = Some(PathBuf::from(arguments.remove(index + 1)));
+            arguments.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+    Ok(db_path.unwrap_or_else(|| PathBuf::from("btrfs-dup.db")))
 }
 
 fn install() -> Result<()> {
@@ -1424,6 +1445,16 @@ mod tests {
 
         assert_eq!(deepest.target, Path::new("/e"));
         assert_ne!(deepest.fs_type, "btrfs");
+    }
+
+    #[test]
+    fn database_path_option_is_removed_from_command_arguments() {
+        let mut arguments = vec!["--db".into(), "/var/lib/btrfs-dup".into(), "list".into()];
+
+        let path = take_db_path(&mut arguments).expect("parse database path");
+
+        assert_eq!(path, PathBuf::from("/var/lib/btrfs-dup"));
+        assert_eq!(arguments, vec!["list"]);
     }
 
     #[tokio::test]

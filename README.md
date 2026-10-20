@@ -1,13 +1,15 @@
 # btrfs-dup
 
 A minimal Btrfs snapshot scanner and extent deduplicator. The embedded
-SurrealDB store is created in `./btrfs-dup.db`.
+SurrealDB store defaults to `./btrfs-dup.db`. Use the global `--db <path>`
+option to choose another store; the path can appear before or after the command.
 
 ```text
 cargo run --                         # guided start
 cargo run -- dedup /mnt/data
 cargo run -- dedup /dev/nvme0n1p2
-cargo run -- list
+cargo run -- --db /var/lib/btrfs-dup dedup /mnt/data
+cargo run -- list --db /var/lib/btrfs-dup
 cargo run -- status <scan-id>
 cargo run -- resume <scan-id>
 cargo run -- dedup --resume <scan-id>
@@ -40,7 +42,7 @@ progress panel from their saved byte and block counts. New block records and
 file checkpoints are buffered and flushed to SurrealDB in batches at least
 every 30 seconds and at scan completion; an abrupt stop can require redoing
 work since the latest flush.
-Each worker hashes a group of up to 16 files and commits their block rows in
+Each worker hashes a group of up to 256 files and commits their block rows in
 one array-bound SurrealQL loop. The coordinator later persists BLAKE3 collision
 upgrades, duplicate relationships, and completed-file checkpoints in periodic
 batches. A file checkpoint is not written until its candidate processing is
