@@ -1,13 +1,8 @@
 use std::{path::PathBuf, sync::OnceLock};
 
 use dioxus::prelude::*;
-use futures::TryStreamExt;
-use lancedb::{
-    arrow::arrow_array::{RecordBatch, StringArray, UInt64Array},
-    query::{ExecutableQuery, QueryBase},
-};
 
-use crate::{Block, Duplicate, Scan, ScannedFile, ensure_record_indexes, format_bytes};
+use crate::{Block, Duplicate, Scan, ScannedFile, format_bytes};
 
 const PAGE_SIZE: usize = 50;
 static DATABASE_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -18,6 +13,7 @@ struct BrowserRow {
     scan: String,
     summary: String,
     duplicate: Option<Duplicate>,
+    commited: bool,
 }
 
 struct BrowserPage {
@@ -85,47 +81,33 @@ fn App() -> Element {
                 table { style: "width:100%; border-collapse:collapse; text-align:left; font-size:13px;",
                     thead {
                         tr { style: "color:#94a3b8; background:#172233;",
-                            th { style: "padding:12px 14px;", "Source path" }
-                            th { style: "padding:12px 14px; white-space:nowrap;", "Source start" }
-                            th { style: "padding:12px 14px; white-space:nowrap;", "Source end (exclusive)" }
-                            th { style: "padding:12px 14px;", "Destination path" }
-                            th { style: "padding:12px 14px; white-space:nowrap;", "Destination start" }
-                            th { style: "padding:12px 14px; white-space:nowrap;", "Destination end (exclusive)" }
-                            th { style: "padding:12px 14px; white-space:nowrap;", "Range length" }
-                            th { style: "padding:12px 14px; white-space:nowrap;", "Deduped" }
-                            th { style: "padding:12px 14px;", "Record ID" }
+                            th { style: "padding:12px 14px; width:50%;", "Source" }
+                            th { style: "padding:12px 14px; width:50%;", "Target" }
                         }
                     }
                     tbody {
                         for row in data.rows.iter() {
                             if let Some(duplicate) = &row.duplicate {
                                 tr { key: "{row.id}", style: "border-top:1px solid #263244; color:#dbe5f2;",
-                                    td { style: "padding:12px 14px; min-width:240px; font-family:monospace; overflow-wrap:anywhere;",
-                                        "{String::from_utf8_lossy(&duplicate.source_path)}"
+                                    td { style: "padding:12px 14px; min-width:300px; font-family:monospace; overflow-wrap:anywhere;",
+                                        div { "{String::from_utf8_lossy(&duplicate.source_path)}" }
+                                        div { style: "margin-top:5px; color:#94a3b8; font-size:12px; white-space:nowrap;",
+                                            "({format_bytes(duplicate.source_offset)}, {format_bytes(duplicate.source_offset.saturating_add(duplicate.len))})"
+                                        }
                                     }
-                                    td { style: "padding:12px 14px; white-space:nowrap; font-family:monospace;",
-                                        "{duplicate.source_offset}"
-                                    }
-                                    td { style: "padding:12px 14px; white-space:nowrap; font-family:monospace;",
-                                        "{duplicate.source_offset.saturating_add(duplicate.len)}"
-                                    }
-                                    td { style: "padding:12px 14px; min-width:240px; font-family:monospace; overflow-wrap:anywhere;",
-                                        "{String::from_utf8_lossy(&duplicate.duplicate_path)}"
-                                    }
-                                    td { style: "padding:12px 14px; white-space:nowrap; font-family:monospace;",
-                                        "{duplicate.duplicate_offset}"
-                                    }
-                                    td { style: "padding:12px 14px; white-space:nowrap; font-family:monospace;",
-                                        "{duplicate.duplicate_offset.saturating_add(duplicate.len)}"
-                                    }
-                                    td { style: "padding:12px 14px; white-space:nowrap;",
-                                        "{format_bytes(duplicate.len)}"
-                                    }
-                                    td { style: "padding:12px 14px; white-space:nowrap;",
-                                        "{format_bytes(duplicate.deduped_bytes)}"
-                                    }
-                                    td { style: "padding:12px 14px; white-space:nowrap; font-family:monospace; color:#a5b4c8;",
-                                        "{row.id}"
+                                    td { style: "padding:12px 14px; min-width:300px; font-family:monospace; overflow-wrap:anywhere;",
+                                        div { "{String::from_utf8_lossy(&duplicate.duplicate_path)}" }
+                                        div { style: "margin-top:5px; color:#94a3b8; font-size:12px; white-space:nowrap;",
+                                            "({format_bytes(duplicate.duplicate_offset)}, {format_bytes(duplicate.duplicate_offset.saturating_add(duplicate.len))}) · {format_bytes(duplicate.len)}"
+                                        }
+                                        div { style: "margin-top:4px; color:#94a3b8; font-size:12px;",
+                                            "Deduped {format_bytes(duplicate.deduped_bytes)} · "
+                                            if row.commited {
+                                                "Commited"
+                                            } else {
+                                                "Not commited"
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -237,7 +219,7 @@ fn App() -> Element {
                     div { style: "margin-top:5px; color:#94a3b8; font-family:monospace;", "{database_path}" }
                 }
             }
-            main { style: "flex:1; min-width:0; padding:0;",
+            main { style: "flex:1; min-width:0; box-sizing:border-box; padding:24px 32px;",
                 div { style: "display:flex; justify-content:space-between; align-items:flex-start; gap:20px; margin-bottom:28px;",
                     div {
                         div { style: "margin-bottom:7px; color:#7dd3fc; font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:1.1px;",
@@ -295,62 +277,22 @@ fn App() -> Element {
     }
 }
 
-async fn load_page(
+fn load_page(
     database_path: PathBuf,
     scan: Option<String>,
     kind: String,
     page: usize,
 ) -> Result<BrowserPage, String> {
-    let connection = lancedb::connect(
-        database_path
-            .to_str()
-            .ok_or_else(|| "database path is not valid UTF-8".to_owned())?,
-    )
-    .execute()
-    .await
-    .map_err(|error| error.to_string())?;
-    let table_names = connection
-        .table_names()
-        .execute()
-        .await
-        .map_err(|error| error.to_string())?;
-    if !table_names.iter().any(|name| name == "records") {
-        return Err("database does not contain a records table".to_owned());
-    }
-    let table = connection
-        .open_table("records")
-        .execute()
-        .await
-        .map_err(|error| error.to_string())?;
-    ensure_record_indexes(&table)
-        .await
-        .map_err(|error| error.to_string())?;
-
-    let predicate = match (scan.as_deref(), kind.as_str()) {
-        (Some(scan_id), "all") => format!("scan = '{}'", sql_quote(scan_id)),
-        (Some(scan_id), kind) => format!(
-            "scan = '{}' AND kind = '{}'",
-            sql_quote(scan_id),
-            sql_quote(kind)
-        ),
-        (None, _) => "kind = 'scan'".to_owned(),
-    };
     let offset = page.saturating_mul(PAGE_SIZE);
-    let batches = table
-        .query()
-        .only_if(predicate)
-        .limit(PAGE_SIZE + 1)
-        .offset(offset)
-        .execute()
-        .await
-        .map_err(|error| error.to_string())?
-        .try_collect::<Vec<RecordBatch>>()
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut rows = Vec::new();
-    for batch in batches {
-        rows.extend(decode_rows(&batch).map_err(|error| error.to_string())?);
-    }
+    let records = crate::load_record_page(
+        &database_path,
+        scan.as_deref(),
+        &kind,
+        PAGE_SIZE + 1,
+        offset,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut rows = decode_rows(&records).map_err(|error| error.to_string())?;
     let has_next = rows.len() > PAGE_SIZE;
     rows.truncate(PAGE_SIZE);
     Ok(BrowserPage { rows, has_next })
@@ -366,13 +308,7 @@ async fn load_page_off_ui(
     std::thread::Builder::new()
         .name("btrfs-dup-db-browser".to_owned())
         .spawn(move || {
-            let result = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime.block_on(load_page(database_path, scan, kind, page)),
-                Err(error) => Err(format!("could not start database worker: {error}")),
-            };
+            let result = load_page(database_path, scan, kind, page);
             let _ = result_tx.send(result);
         })
         .map_err(|error| format!("could not start database worker thread: {error}"))?;
@@ -381,32 +317,13 @@ async fn load_page_off_ui(
         .map_err(|_| "database worker stopped before returning the page".to_owned())?
 }
 
-fn decode_rows(batch: &RecordBatch) -> Result<Vec<BrowserRow>, Box<dyn std::error::Error>> {
-    let string_column = |index: usize| -> Result<&StringArray, Box<dyn std::error::Error>> {
-        batch
-            .column(index)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| format!("column {index} is not UTF-8").into())
-    };
-    let uint_column = |index: usize| -> Result<&UInt64Array, Box<dyn std::error::Error>> {
-        batch
-            .column(index)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| format!("column {index} is not UInt64").into())
-    };
-    let (ids, kinds, scans, payloads) = (
-        string_column(0)?,
-        string_column(1)?,
-        string_column(2)?,
-        string_column(6)?,
-    );
-    let (lengths, hashes) = (uint_column(3)?, uint_column(4)?);
-    let mut rows = Vec::with_capacity(batch.num_rows());
-    for row in 0..batch.num_rows() {
-        let kind = kinds.value(row).to_owned();
-        let payload = payloads.value(row);
+fn decode_rows(
+    records: &[crate::StoredRecord],
+) -> Result<Vec<BrowserRow>, Box<dyn std::error::Error>> {
+    let mut rows = Vec::with_capacity(records.len());
+    for record in records {
+        let kind = record.kind.clone();
+        let payload = record.payload.as_str();
         let mut duplicate_row = None;
         let summary = match kind.as_str() {
             "scan" => {
@@ -441,7 +358,8 @@ fn decode_rows(batch: &RecordBatch) -> Result<Vec<BrowserRow>, Box<dyn std::erro
                 )
             }
             "duplicate" => {
-                let duplicate: Duplicate = serde_json::from_str(payload)?;
+                let mut duplicate: Duplicate = serde_json::from_str(payload)?;
+                duplicate.commited = record.commited;
                 let summary = format!(
                     "{} @ {} ↔ {} @ {} · {} · deduped {}",
                     String::from_utf8_lossy(&duplicate.duplicate_path),
@@ -456,23 +374,19 @@ fn decode_rows(batch: &RecordBatch) -> Result<Vec<BrowserRow>, Box<dyn std::erro
             }
             other => format!(
                 "unknown kind {other} · len={} · XXH3 {:016x}",
-                lengths.value(row),
-                hashes.value(row)
+                record.len, record.xxh3
             ),
         };
         rows.push(BrowserRow {
-            id: ids.value(row).to_owned(),
+            id: record.id.clone(),
             kind,
-            scan: scans.value(row).to_owned(),
+            scan: record.scan.clone(),
             summary,
             duplicate: duplicate_row,
+            commited: record.commited,
         });
     }
     Ok(rows)
-}
-
-fn sql_quote(value: &str) -> String {
-    value.replace('\'', "''")
 }
 
 #[cfg(test)]
@@ -489,15 +403,7 @@ mod tests {
             "btrfs-dup-gui-pagination-{}-{unique}",
             std::process::id()
         ));
-        let connection = lancedb::connect(path.to_str().expect("UTF-8 test path"))
-            .execute()
-            .await
-            .expect("connect");
-        let table = connection
-            .create_empty_table("records", crate::record_schema())
-            .execute()
-            .await
-            .expect("create records table");
+        let store = crate::open_store(&path).expect("open temporary SQLite database");
         let records = (0..=PAGE_SIZE)
             .map(|index| {
                 let id = format!("scan-{index:03}");
@@ -514,11 +420,8 @@ mod tests {
             })
             .collect::<crate::Result<Vec<_>>>()
             .expect("encode scans");
-        crate::write_records(&table, records)
-            .await
-            .expect("insert scans");
-        drop(table);
-        drop(connection);
+        crate::write_records(&store, records).expect("insert scans");
+        drop(store);
 
         let first = load_page_off_ui(path.clone(), None, "scan".to_owned(), 0)
             .await
@@ -531,6 +434,6 @@ mod tests {
         assert_eq!(second.rows.len(), 1);
         assert!(!second.has_next);
 
-        let _ = std::fs::remove_dir_all(path);
+        let _ = std::fs::remove_file(path);
     }
 }

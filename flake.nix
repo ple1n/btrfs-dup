@@ -37,7 +37,6 @@
             src = self;
             cargoLock.lockFile = ./Cargo.lock;
             nativeBuildInputs = [
-              pkgs.protobuf
               pkgs.llvmPackages.clang
               pkgs.llvmPackages.libclang
               pkgs.pkg-config
@@ -70,7 +69,6 @@
           default = pkgs.mkShell {
             packages = [
               rust
-              pkgs.protobuf
               pkgs.pkg-config
               pkgs.llvmPackages.clang
               pkgs.llvmPackages.libclang

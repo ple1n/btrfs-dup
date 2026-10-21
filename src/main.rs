@@ -21,21 +21,12 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use btrfs_uapi::dedupe::{DedupeResult, DedupeTarget, file_extent_same};
 use btrfs_uapi::subvolume;
-use futures::TryStreamExt;
-use lancedb::{
-    Table,
-    arrow::{
-        arrow_array::{RecordBatch, RecordBatchIterator, StringArray, UInt64Array},
-        arrow_schema::{DataType, Field, Schema},
-    },
-    index::{
-        Index,
-        scalar::{BTreeIndexBuilder, BitmapIndexBuilder},
-    },
-    query::{ExecutableQuery, QueryBase},
+use btrfs_uapi::{
+    dedupe::{DedupeResult, DedupeTarget, file_extent_same},
+    filesystem::filesystem_info,
 };
+use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 use twox_hash::XxHash3_64;
 
@@ -43,8 +34,9 @@ mod gui;
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
-const TEN_MIB: usize = 10 * 1024 * 1024;
-const HUNDRED_MIB: usize = 100 * 1024 * 1024;
+const MAX_DEDUPE_IOCTL_LEN: u64 = 16 * MIB;
+const BLOCK_CHUNK_SIZE: usize = MAX_DEDUPE_IOCTL_LEN as usize;
+const LARGE_BLOCK_CHUNK_SIZE: usize = (6 * MAX_DEDUPE_IOCTL_LEN) as usize;
 const HASH_WORKER_BATCH_FILES: usize = 256;
 const SNAPSHOT_DIR: &str = ".btrfs-dup-snapshots";
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -59,12 +51,12 @@ enum BlockDecision {
 fn block_decision_function(file_size: u64) -> BlockDecision {
     if file_size < 2 * MIB {
         BlockDecision::Exclude
-    } else if file_size < 10 * MIB {
+    } else if file_size < BLOCK_CHUNK_SIZE as u64 {
         BlockDecision::WholeFile
     } else if file_size < 2 * GIB {
-        BlockDecision::FixedChunks(TEN_MIB)
+        BlockDecision::FixedChunks(BLOCK_CHUNK_SIZE)
     } else {
-        BlockDecision::FixedChunks(HUNDRED_MIB)
+        BlockDecision::FixedChunks(LARGE_BLOCK_CHUNK_SIZE)
     }
 }
 
@@ -115,6 +107,7 @@ struct Duplicate {
     len: u64,
     deduped_bytes: u64,
     dry_run: bool,
+    commited: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,8 +117,26 @@ struct StoredRecord {
     scan: String,
     len: u64,
     xxh3: u64,
-    hash_key: u64,
+    commited: bool,
     payload: String,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DuplicateStats {
+    pairs: u64,
+    range_bytes: u64,
+    deduped_bytes: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ScanDuplicateStats {
+    commited: DuplicateStats,
+    uncommited: DuplicateStats,
+}
+
+#[derive(Clone)]
+struct Store {
+    connection: Arc<std::sync::Mutex<Connection>>,
 }
 
 struct WriteBatch {
@@ -147,7 +158,7 @@ impl WriteBatch {
         }
     }
 
-    async fn flush(&mut self, table: &Table, scan: &Scan) -> Result<()> {
+    async fn flush(&mut self, store: &Store, scan: &Scan) -> Result<()> {
         if self.blocks.is_empty() && self.files.is_empty() && self.duplicates.is_empty() {
             self.last_flush = Instant::now();
             return Ok(());
@@ -178,9 +189,7 @@ impl WriteBatch {
         records.extend(
             duplicates
                 .iter()
-                .map(|(id, duplicate)| {
-                    stored_record(id, "duplicate", &duplicate.scan, 0, &[], duplicate)
-                })
+                .map(|(id, duplicate)| stored_duplicate_record(id, duplicate))
                 .collect::<Result<Vec<_>>>()?,
         );
         records.push(stored_record(
@@ -191,7 +200,7 @@ impl WriteBatch {
             &[],
             scan,
         )?);
-        if let Err(error) = write_records(table, records).await {
+        if let Err(error) = write_records_off_thread(store, records).await {
             self.blocks.extend(blocks);
             self.files.extend(files);
             self.duplicates.extend(duplicates);
@@ -473,18 +482,6 @@ fn format_duration(duration: Duration) -> String {
     )
 }
 
-fn record_schema() -> std::sync::Arc<Schema> {
-    std::sync::Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
-        Field::new("kind", DataType::Utf8, false),
-        Field::new("scan", DataType::Utf8, false),
-        Field::new("len", DataType::UInt64, false),
-        Field::new("xxh3", DataType::UInt64, false),
-        Field::new("hash_key", DataType::UInt64, false),
-        Field::new("payload", DataType::Utf8, false),
-    ]))
-}
-
 fn stored_record<T: Serialize>(
     id: &str,
     kind: &str,
@@ -501,55 +498,29 @@ fn stored_record<T: Serialize>(
         ),
         _ => return Err("XXH3 hash must contain exactly 8 bytes".into()),
     };
-    let mut tuple_hasher = XxHash3_64::default();
-    tuple_hasher.write(&len.to_be_bytes());
-    tuple_hasher.write(hash);
     Ok(StoredRecord {
         id: id.to_owned(),
         kind: kind.to_owned(),
         scan: scan.to_owned(),
         len,
         xxh3,
-        hash_key: tuple_hasher.finish(),
+        commited: false,
         payload: serde_json::to_string(payload)?,
     })
+}
+
+fn stored_duplicate_record(id: &str, duplicate: &Duplicate) -> Result<StoredRecord> {
+    let mut record = stored_record(id, "duplicate", &duplicate.scan, 0, &[], duplicate)?;
+    record.commited = duplicate.commited;
+    record.len = duplicate.len;
+    Ok(record)
 }
 
 fn decode_record<T: for<'de> Deserialize<'de>>(record: &StoredRecord) -> Result<T> {
     Ok(serde_json::from_str(&record.payload)?)
 }
 
-fn record_batch(records: &[StoredRecord]) -> Result<RecordBatch> {
-    let schema = record_schema();
-    Ok(RecordBatch::try_new(
-        schema,
-        vec![
-            std::sync::Arc::new(StringArray::from_iter_values(
-                records.iter().map(|record| record.id.as_str()),
-            )),
-            std::sync::Arc::new(StringArray::from_iter_values(
-                records.iter().map(|record| record.kind.as_str()),
-            )),
-            std::sync::Arc::new(StringArray::from_iter_values(
-                records.iter().map(|record| record.scan.as_str()),
-            )),
-            std::sync::Arc::new(UInt64Array::from_iter_values(
-                records.iter().map(|record| record.len),
-            )),
-            std::sync::Arc::new(UInt64Array::from_iter_values(
-                records.iter().map(|record| record.xxh3),
-            )),
-            std::sync::Arc::new(UInt64Array::from_iter_values(
-                records.iter().map(|record| record.hash_key),
-            )),
-            std::sync::Arc::new(StringArray::from_iter_values(
-                records.iter().map(|record| record.payload.as_str()),
-            )),
-        ],
-    )?)
-}
-
-async fn write_records(table: &Table, records: Vec<StoredRecord>) -> Result<()> {
+fn write_records(store: &Store, records: Vec<StoredRecord>) -> Result<()> {
     if records.is_empty() {
         return Ok(());
     }
@@ -558,7 +529,7 @@ async fn write_records(table: &Table, records: Vec<StoredRecord>) -> Result<()> 
         if let Some(existing) = unique_records.get(&record.id) {
             if existing != &record {
                 return Err(
-                    format!("conflicting LanceDB rows share record id {}", record.id).into(),
+                    format!("conflicting database rows share record id {}", record.id).into(),
                 );
             }
         } else {
@@ -566,97 +537,260 @@ async fn write_records(table: &Table, records: Vec<StoredRecord>) -> Result<()> 
         }
     }
     let records = unique_records.into_values().collect::<Vec<_>>();
-    let batch = record_batch(&records)?;
-    let schema = batch.schema();
-    let source = RecordBatchIterator::new(vec![Ok(batch)], schema);
-    let mut merge = table.merge_insert(&["id"]);
-    merge
-        .when_matched_update_all(None)
-        .when_not_matched_insert_all();
-    merge.execute(Box::new(source)).await?;
+    let mut connection = store
+        .connection
+        .lock()
+        .map_err(|_| "SQLite connection lock was poisoned")?;
+    let transaction = connection.transaction()?;
+    {
+        let mut statement = transaction.prepare(
+            "INSERT INTO records (id, kind, scan, len, xxh3, commited, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+                 kind = excluded.kind,
+                 scan = excluded.scan,
+                 len = excluded.len,
+                 xxh3 = excluded.xxh3,
+                 commited = excluded.commited,
+                 payload = excluded.payload",
+        )?;
+        for record in records {
+            let len = i64::try_from(record.len).map_err(|_| {
+                format!("record {} length exceeds SQLite's integer range", record.id)
+            })?;
+            statement.execute(params![
+                record.id,
+                record.kind,
+                record.scan,
+                len,
+                record.xxh3 as i64,
+                record.commited,
+                record.payload
+            ])?;
+        }
+    }
+    transaction.commit()?;
     Ok(())
 }
 
-async fn load_records(table: &Table, kind: &str, scan: Option<&str>) -> Result<Vec<StoredRecord>> {
-    let predicate = match scan {
-        Some(scan) => format!(
-            "kind = '{}' AND scan = '{}'",
-            kind.replace('\'', "''"),
-            scan.replace('\'', "''")
-        ),
-        None => format!("kind = '{}'", kind.replace('\'', "''")),
-    };
-    let batches = table
-        .query()
-        .only_if(predicate)
-        .execute()
-        .await?
-        .try_collect::<Vec<RecordBatch>>()
-        .await?;
+async fn write_records_off_thread(store: &Store, records: Vec<StoredRecord>) -> Result<()> {
+    let store = store.clone();
+    tokio::task::spawn_blocking(move || {
+        write_records(&store, records).map_err(|error| error.to_string())
+    })
+    .await?
+    .map_err(std::io::Error::other)?;
+    Ok(())
+}
+
+fn collect_record_rows(mut rows: rusqlite::Rows<'_>) -> Result<Vec<StoredRecord>> {
     let mut records = Vec::new();
-    for batch in batches {
-        let ids = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or("invalid id column")?;
-        let kinds = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or("invalid kind column")?;
-        let scans = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or("invalid scan column")?;
-        let lens = batch
-            .column(3)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or("invalid len column")?;
-        let hashes = batch
-            .column(4)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or("invalid xxh3 column")?;
-        let hash_keys = batch
-            .column(5)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or("invalid hash_key column")?;
-        let payloads = batch
-            .column(6)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or("invalid payload column")?;
-        for row in 0..batch.num_rows() {
-            records.push(StoredRecord {
-                id: ids.value(row).to_owned(),
-                kind: kinds.value(row).to_owned(),
-                scan: scans.value(row).to_owned(),
-                len: lens.value(row),
-                xxh3: hashes.value(row),
-                hash_key: hash_keys.value(row),
-                payload: payloads.value(row).to_owned(),
-            });
+    while let Some(row) = rows.next()? {
+        let len: i64 = row.get(3)?;
+        if len < 0 {
+            return Err("database record has a negative length".into());
         }
+        records.push(StoredRecord {
+            id: row.get(0)?,
+            kind: row.get(1)?,
+            scan: row.get(2)?,
+            len: len as u64,
+            xxh3: row.get::<_, i64>(4)? as u64,
+            commited: row.get(5)?,
+            payload: row.get(6)?,
+        });
     }
     Ok(records)
 }
 
-async fn load_scan(table: &Table, scan_id: &str) -> Result<Scan> {
-    let record = load_records(table, "scan", Some(scan_id))
-        .await?
+fn load_records(store: &Store, kind: &str, scan: Option<&str>) -> Result<Vec<StoredRecord>> {
+    let connection = store
+        .connection
+        .lock()
+        .map_err(|_| "SQLite connection lock was poisoned")?;
+    let sql = match scan {
+        Some(_) => {
+            "SELECT id, kind, scan, len, xxh3, commited, payload
+             FROM records WHERE kind = ?1 AND scan = ?2 ORDER BY id"
+        }
+        None => {
+            "SELECT id, kind, scan, len, xxh3, commited, payload
+             FROM records WHERE kind = ?1 ORDER BY id"
+        }
+    };
+    let mut statement = connection.prepare(sql)?;
+    let rows = match scan {
+        Some(scan) => statement.query(params![kind, scan])?,
+        None => statement.query(params![kind])?,
+    };
+    collect_record_rows(rows)
+}
+
+fn load_scan(store: &Store, scan_id: &str) -> Result<Scan> {
+    let record = load_records(store, "scan", Some(scan_id))?
         .into_iter()
         .find(|record| record.id == scan_record_id(scan_id))
         .ok_or("scan not found")?;
     decode_record(&record)
 }
 
-async fn write_scan(table: &Table, scan: &Scan) -> Result<()> {
+fn ensure_scan_resumable(scan: &Scan) -> Result<()> {
+    if scan.state == "finished" {
+        return Err(format!(
+            "scan {} has been finished; its snapshot is no longer available for resume",
+            scan.key()
+        )
+        .into());
+    }
+    if !Path::new(&scan.snapshot).exists() {
+        return Err(format!(
+            "scan {} cannot be resumed because its snapshot is missing",
+            scan.key()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn finish_scan(store: &Store, mut scan: Scan, delete_data: bool) -> Result<()> {
+    if scan.state != "complete" && scan.state != "finished" {
+        return Err(format!(
+            "scan {} is {}; only complete scans can be finished",
+            scan.key(),
+            scan.state
+        )
+        .into());
+    }
+
+    let source = fs::canonicalize(&scan.source)?;
+    if resolve_btrfs_mount(&source)? != source {
+        return Err("scan source is no longer the mounted Btrfs root".into());
+    }
+    let snapshot_parent = source.join(SNAPSHOT_DIR);
+    let snapshot_name = format!(".btrfs-dup-{}", scan.key());
+    let expected_snapshot = snapshot_parent.join(&snapshot_name);
+    let snapshot = PathBuf::from(&scan.snapshot);
+    if snapshot != expected_snapshot {
+        return Err("refusing to finish: saved snapshot path does not match this scan".into());
+    }
+
+    let root_fd = File::open(&source)?;
+    let parent_fd = File::open(&snapshot_parent)?;
+    match fs::symlink_metadata(&snapshot) {
+        Ok(metadata) => {
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(
+                    "refusing to finish: scan snapshot is not a directory subvolume".into(),
+                );
+            }
+            let snapshot_fd = File::open(&snapshot)?;
+            let snapshot_info = subvolume::subvolume_info(snapshot_fd.as_fd())?;
+            let parent_info = subvolume::subvolume_info(parent_fd.as_fd())?;
+            if snapshot_info.id == parent_info.id
+                || !snapshot_info
+                    .flags
+                    .contains(subvolume::SubvolumeFlags::RDONLY)
+            {
+                return Err(
+                    "refusing to finish: target is not this scan's read-only Btrfs snapshot".into(),
+                );
+            }
+            drop(snapshot_fd);
+            let snapshot_name = CString::new(snapshot_name)?;
+            subvolume::subvolume_delete(parent_fd.as_fd(), &snapshot_name)?;
+            subvolume::subvol_sync_wait_one(root_fd.as_fd(), snapshot_info.id)?;
+            println!(
+                "Deleted scan snapshot and waited for Btrfs cleanup to finish: {}",
+                snapshot.display()
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!("Scan snapshot is already absent: {}", snapshot.display());
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    if delete_data {
+        let deleted = delete_scan_records(store, scan.key())?;
+        println!(
+            "Deleted {deleted} database records for scan {}.",
+            scan.key()
+        );
+    } else {
+        scan.state = "finished".into();
+        write_scan(store, &scan)?;
+        println!(
+            "Scan {} is finished. Its database records were retained; it can no longer be resumed.",
+            scan.key()
+        );
+    }
+    Ok(())
+}
+
+fn delete_scan_records(store: &Store, scan_id: &str) -> Result<usize> {
+    let mut connection = store
+        .connection
+        .lock()
+        .map_err(|_| "SQLite connection lock was poisoned")?;
+    let transaction = connection.transaction()?;
+    let deleted = transaction.execute("DELETE FROM records WHERE scan = ?1", params![scan_id])?;
+    transaction.commit()?;
+    Ok(deleted)
+}
+
+fn load_pending_duplicates(store: &Store, scan_id: &str) -> Result<Vec<Duplicate>> {
+    let connection = store
+        .connection
+        .lock()
+        .map_err(|_| "SQLite connection lock was poisoned")?;
+    let mut statement = connection.prepare(
+        "SELECT id, kind, scan, len, xxh3, commited, payload
+         FROM records
+         WHERE kind = 'duplicate' AND scan = ?1 AND commited = 0
+         ORDER BY id",
+    )?;
+    collect_record_rows(statement.query(params![scan_id])?)?
+        .iter()
+        .map(decode_record::<Duplicate>)
+        .collect()
+}
+
+fn load_duplicate_stats(store: &Store, scan_id: &str) -> Result<ScanDuplicateStats> {
+    let connection = store
+        .connection
+        .lock()
+        .map_err(|_| "SQLite connection lock was poisoned")?;
+    let mut statement = connection.prepare(
+        "SELECT commited, COUNT(*),
+                COALESCE(SUM(CAST(json_extract(payload, '$.len') AS INTEGER)), 0),
+                COALESCE(SUM(CAST(json_extract(payload, '$.deduped_bytes') AS INTEGER)), 0)
+         FROM records
+         WHERE kind = 'duplicate' AND scan = ?1
+         GROUP BY commited",
+    )?;
+    let mut rows = statement.query(params![scan_id])?;
+    let mut stats = ScanDuplicateStats::default();
+    while let Some(row) = rows.next()? {
+        let duplicate_stats = DuplicateStats {
+            pairs: u64::try_from(row.get::<_, i64>(1)?)
+                .map_err(|_| "database returned a negative duplicate count")?,
+            range_bytes: u64::try_from(row.get::<_, i64>(2)?)
+                .map_err(|_| "database returned a negative duplicate range total")?,
+            deduped_bytes: u64::try_from(row.get::<_, i64>(3)?)
+                .map_err(|_| "database returned a negative deduped byte total")?,
+        };
+        if row.get::<_, bool>(0)? {
+            stats.commited = duplicate_stats;
+        } else {
+            stats.uncommited = duplicate_stats;
+        }
+    }
+    Ok(stats)
+}
+
+fn write_scan(store: &Store, scan: &Scan) -> Result<()> {
     write_records(
-        table,
+        store,
         vec![stored_record(
             &scan_record_id(scan.key()),
             "scan",
@@ -666,52 +800,78 @@ async fn write_scan(table: &Table, scan: &Scan) -> Result<()> {
             scan,
         )?],
     )
-    .await
 }
 
-async fn open_store(path: &Path) -> Result<Table> {
-    let connection = lancedb::connect(&path.to_string_lossy()).execute().await?;
-    let names = connection.table_names().execute().await?;
-    let table = if names.iter().any(|name| name == "records") {
-        connection.open_table("records").execute().await?
-    } else {
-        connection
-            .create_empty_table("records", record_schema())
-            .execute()
-            .await?
+fn open_store(path: &Path) -> Result<Store> {
+    let connection = Connection::open(path)?;
+    connection.busy_timeout(Duration::from_secs(30))?;
+    connection.pragma_update(None, "journal_mode", "WAL")?;
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS records (
+             id TEXT PRIMARY KEY NOT NULL,
+             kind TEXT NOT NULL,
+             scan TEXT NOT NULL,
+             len INTEGER NOT NULL CHECK (len >= 0),
+             xxh3 INTEGER NOT NULL,
+             commited INTEGER NOT NULL DEFAULT 0 CHECK (commited IN (0, 1)),
+             payload TEXT NOT NULL
+         ) WITHOUT ROWID;
+         CREATE INDEX IF NOT EXISTS records_kind_scan_id
+             ON records(kind, scan, id);
+         CREATE INDEX IF NOT EXISTS records_block_match
+             ON records(kind, scan, len, xxh3);
+         CREATE INDEX IF NOT EXISTS records_pending_duplicates
+             ON records(kind, scan, commited, id);",
+    )?;
+    Ok(Store {
+        connection: Arc::new(std::sync::Mutex::new(connection)),
+    })
+}
+
+fn load_record_page(
+    path: &Path,
+    scan: Option<&str>,
+    kind: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<StoredRecord>> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.busy_timeout(Duration::from_secs(30))?;
+    let has_records: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'records'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_records {
+        return Err("database does not contain a records table".into());
+    }
+    let limit = i64::try_from(limit)?;
+    let offset = i64::try_from(offset)?;
+    let mut statement = match (scan, kind) {
+        (Some(_), "all") => connection.prepare(
+            "SELECT id, kind, scan, len, xxh3, commited, payload
+             FROM records WHERE scan = ?1 ORDER BY id LIMIT ?2 OFFSET ?3",
+        )?,
+        (Some(_), _) => connection.prepare(
+            "SELECT id, kind, scan, len, xxh3, commited, payload
+             FROM records WHERE scan = ?1 AND kind = ?2 ORDER BY id LIMIT ?3 OFFSET ?4",
+        )?,
+        (None, _) => connection.prepare(
+            "SELECT id, kind, scan, len, xxh3, commited, payload
+             FROM records WHERE kind = 'scan' ORDER BY id LIMIT ?1 OFFSET ?2",
+        )?,
     };
-    ensure_record_indexes(&table).await?;
-    Ok(table)
-}
-
-async fn ensure_record_indexes(table: &Table) -> Result<()> {
-    let mut indexed_columns = table
-        .list_indices()
-        .await?
-        .into_iter()
-        .flat_map(|index| index.columns)
-        .collect::<HashSet<_>>();
-    for column in ["scan", "id", "hash_key"] {
-        if indexed_columns.contains(column) {
-            continue;
-        }
-        eprintln!("Building B-tree index on {column} for existing records...");
-        table
-            .create_index(&[column], Index::BTree(BTreeIndexBuilder::default()))
-            .execute()
-            .await?;
-        indexed_columns.insert(column.to_owned());
-        eprintln!("B-tree index on {column} is ready.");
-    }
-    if !indexed_columns.contains("kind") {
-        eprintln!("Building bitmap index on kind for existing records...");
-        table
-            .create_index(&["kind"], Index::Bitmap(BitmapIndexBuilder::default()))
-            .execute()
-            .await?;
-        eprintln!("Bitmap index on kind is ready.");
-    }
-    Ok(())
+    let rows = match (scan, kind) {
+        (Some(scan), "all") => statement.query(params![scan, limit, offset])?,
+        (Some(scan), _) => statement.query(params![scan, kind, limit, offset])?,
+        (None, _) => statement.query(params![limit, offset])?,
+    };
+    collect_record_rows(rows)
 }
 
 fn main() -> Result<()> {
@@ -753,7 +913,7 @@ fn main() -> Result<()> {
 async fn run_cli(arguments: Vec<std::ffi::OsString>, db_path: PathBuf) -> Result<()> {
     let command = arguments.first().cloned().unwrap_or_else(|| "dedup".into());
     let mut args = arguments.into_iter().skip(1);
-    let table = open_store(&db_path).await?;
+    let store = open_store(&db_path)?;
     if command == "verify" || command == "commit" {
         eprintln!("Database opened; loading scan records...");
     }
@@ -767,11 +927,12 @@ async fn run_cli(arguments: Vec<std::ffi::OsString>, db_path: PathBuf) -> Result
                     .cloned()
                     .ok_or("missing scan id after --resume")?;
                 let id = id.to_string_lossy().into_owned();
-                let mut scan = load_scan(&table, &id).await?;
+                let mut scan = load_scan(&store, &id)?;
+                ensure_scan_resumable(&scan)?;
                 scan.scan_id = Some(id.clone());
                 scan.state = "running".into();
-                write_scan(&table, &scan).await?;
-                return run_scan(&table, scan).await;
+                write_scan(&store, &scan)?;
+                return run_scan(&store, scan).await;
             }
             let dry_run_flag = remaining.iter().any(|arg| arg == "--dry-run");
             let input = remaining
@@ -803,8 +964,8 @@ async fn run_cli(arguments: Vec<std::ffi::OsString>, db_path: PathBuf) -> Result
                 "Step 3/3: Starting {} scan.",
                 if dry_run { "dry-run" } else { "deduplication" }
             );
-            let scan = create_scan(&table, &source, dry_run).await?;
-            run_scan(&table, scan).await
+            let scan = create_scan(&store, &source, dry_run).await?;
+            run_scan(&store, scan).await
         }
         "resume" => {
             let id = args
@@ -812,20 +973,19 @@ async fn run_cli(arguments: Vec<std::ffi::OsString>, db_path: PathBuf) -> Result
                 .ok_or("usage: btrfs_dup resume <scan-id>")?
                 .to_string_lossy()
                 .into_owned();
-            let mut scan = load_scan(&table, &id).await?;
+            let mut scan = load_scan(&store, &id)?;
+            ensure_scan_resumable(&scan)?;
             scan.scan_id = Some(id.clone());
             scan.state = "running".into();
-            write_scan(&table, &scan).await?;
-            run_scan(&table, scan).await
+            write_scan(&store, &scan)?;
+            run_scan(&store, scan).await
         }
         "list" => {
-            let scans = load_records(&table, "scan", None)
-                .await?
+            let scans = load_records(&store, "scan", None)?
                 .iter()
                 .map(decode_record::<Scan>)
                 .collect::<Result<Vec<_>>>()?;
-            let duplicates = load_records(&table, "duplicate", None)
-                .await?
+            let duplicates = load_records(&store, "duplicate", None)?
                 .iter()
                 .map(decode_record::<Duplicate>)
                 .collect::<Result<Vec<_>>>()?;
@@ -874,8 +1034,37 @@ async fn run_cli(arguments: Vec<std::ffi::OsString>, db_path: PathBuf) -> Result
                 .ok_or("usage: btrfs_dup status <scan-id>")?
                 .to_string_lossy()
                 .into_owned();
-            let s = load_scan(&table, &id).await?;
+            let s = load_scan(&store, &id)?;
             println!("{s:#?}");
+            let stats = load_duplicate_stats(&store, &id)?;
+            let total_pairs = stats.commited.pairs.saturating_add(stats.uncommited.pairs);
+            let total_range_bytes = stats
+                .commited
+                .range_bytes
+                .saturating_add(stats.uncommited.range_bytes);
+            let total_deduped_bytes = stats
+                .commited
+                .deduped_bytes
+                .saturating_add(stats.uncommited.deduped_bytes);
+            println!("Duplicate stats:");
+            println!(
+                "  Total: {} pairs, {} candidate, {} deduped",
+                total_pairs,
+                format_bytes(total_range_bytes),
+                format_bytes(total_deduped_bytes)
+            );
+            println!(
+                "  Commited: {} pairs, {} candidate, {} deduped",
+                stats.commited.pairs,
+                format_bytes(stats.commited.range_bytes),
+                format_bytes(stats.commited.deduped_bytes)
+            );
+            println!(
+                "  Not commited: {} pairs, {} candidate, {} deduped",
+                stats.uncommited.pairs,
+                format_bytes(stats.uncommited.range_bytes),
+                format_bytes(stats.uncommited.deduped_bytes)
+            );
             Ok(())
         }
         "verify" => {
@@ -887,10 +1076,9 @@ async fn run_cli(arguments: Vec<std::ffi::OsString>, db_path: PathBuf) -> Result
             if args.next().is_some() {
                 return Err("usage: btrfs-dup verify <scan-id>".into());
             }
-            let scan = load_scan(&table, &id).await?;
+            let scan = load_scan(&store, &id)?;
             eprintln!("Loading duplicate relationships for scan {id}...");
-            let duplicates = load_records(&table, "duplicate", Some(&id))
-                .await?
+            let duplicates = load_records(&store, "duplicate", Some(&id))?
                 .iter()
                 .map(decode_record::<Duplicate>)
                 .collect::<Result<Vec<_>>>()?;
@@ -905,21 +1093,31 @@ async fn run_cli(arguments: Vec<std::ffi::OsString>, db_path: PathBuf) -> Result
             if args.next().is_some() {
                 return Err("usage: btrfs-dup commit <scan-id>".into());
             }
-            let scan = load_scan(&table, &id).await?;
-            eprintln!("Loading duplicate relationships for scan {id}...");
-            let duplicates = load_records(&table, "duplicate", Some(&id))
-                .await?
-                .iter()
-                .map(decode_record::<Duplicate>)
-                .collect::<Result<Vec<_>>>()?;
-            commit_duplicates(&table, &scan, &duplicates).await
+            let scan = load_scan(&store, &id)?;
+            eprintln!("Loading uncommited duplicate relationships for scan {id}...");
+            let duplicates = load_pending_duplicates(&store, &id)?;
+            commit_duplicates(&store, &scan, &duplicates).await
+        }
+        "finish" => {
+            let arguments = args.collect::<Vec<_>>();
+            let delete_data = arguments.iter().any(|argument| argument == "--delete");
+            let scan_ids = arguments
+                .into_iter()
+                .filter(|argument| argument != "--delete")
+                .collect::<Vec<_>>();
+            if scan_ids.len() != 1 {
+                return Err("usage: btrfs-dup finish <scan-id> [--delete]".into());
+            }
+            let id = scan_ids[0].to_string_lossy().into_owned();
+            let scan = load_scan(&store, &id)?;
+            finish_scan(&store, scan, delete_data)
         }
         _ => usage(),
     }
 }
 
 fn usage<T>() -> Result<T> {
-    Err("usage: btrfs-dup [--db <path>] [dedup [<mount-path|/dev/device>] [--dry-run] | dedup --resume <scan-id> | list | status <scan-id> | verify <scan-id> | commit <scan-id> | resume <scan-id> | install]".into())
+    Err("usage: btrfs-dup [--db <path>] [dedup [<mount-path|/dev/device>] [--dry-run] | dedup --resume <scan-id> | list | status <scan-id> | verify <scan-id> | commit <scan-id> | finish <scan-id> [--delete] | resume <scan-id> | gui | install]".into())
 }
 
 fn take_db_path(arguments: &mut Vec<std::ffi::OsString>) -> Result<PathBuf> {
@@ -935,7 +1133,15 @@ fn take_db_path(arguments: &mut Vec<std::ffi::OsString>) -> Result<PathBuf> {
             }
             if matches!(
                 arguments[index + 1].to_string_lossy().as_ref(),
-                "dedup" | "list" | "resume" | "status" | "verify" | "commit" | "gui" | "install"
+                "dedup"
+                    | "list"
+                    | "resume"
+                    | "status"
+                    | "verify"
+                    | "commit"
+                    | "finish"
+                    | "gui"
+                    | "install"
             ) {
                 return Err(
                     "--db is missing its path; use 'btrfs-dup list' for the default database, or 'btrfs-dup --db <path> list'".into(),
@@ -947,7 +1153,7 @@ fn take_db_path(arguments: &mut Vec<std::ffi::OsString>) -> Result<PathBuf> {
             index += 1;
         }
     }
-    Ok(db_path.unwrap_or_else(|| PathBuf::from("btrfs-dup.lance")))
+    Ok(db_path.unwrap_or_else(|| PathBuf::from("btrfs-dup.sqlite")))
 }
 
 fn install() -> Result<()> {
@@ -1209,7 +1415,7 @@ fn choose_mount(mut candidates: Vec<PathBuf>, device: &Path) -> Result<PathBuf> 
         .ok_or_else(|| "invalid choice".into())
 }
 
-async fn create_scan(table: &Table, source: &Path, dry_run: bool) -> Result<Scan> {
+async fn create_scan(store: &Store, source: &Path, dry_run: bool) -> Result<Scan> {
     let source = fs::canonicalize(source)?;
     let source_fd = File::open(&source)?;
     let snapshot_parent = source.join(SNAPSHOT_DIR);
@@ -1233,13 +1439,18 @@ async fn create_scan(table: &Table, source: &Path, dry_run: bool) -> Result<Scan
         files: 0,
         blocks: 0,
     };
-    write_scan(table, &scan).await?;
+    write_scan(store, &scan)?;
     Ok(scan)
 }
 
-async fn run_scan(table: &Table, mut scan: Scan) -> Result<()> {
+async fn run_scan(store: &Store, mut scan: Scan) -> Result<()> {
     let snapshot = PathBuf::from(&scan.snapshot);
     let source = PathBuf::from(&scan.source);
+    let source_fd = File::open(&source)?;
+    let sectorsize = filesystem_info(source_fd.as_fd())?.sectorsize as u64;
+    if sectorsize == 0 {
+        return Err("Btrfs reported a zero-byte sector size".into());
+    }
     println!("Counting files and planned blocks in the snapshot...");
     let mut inventory = Inventory::default();
     let source_mount_id =
@@ -1249,6 +1460,7 @@ async fn run_scan(table: &Table, mut scan: Scan) -> Result<()> {
         &snapshot,
         &source,
         source_mount_id,
+        sectorsize,
         &mut inventory,
     )?;
     if io::stderr().is_terminal() && inventory.last_draw.is_some() {
@@ -1262,14 +1474,14 @@ async fn run_scan(table: &Table, mut scan: Scan) -> Result<()> {
     let mut buckets: HashMap<(usize, u64), Vec<(PathBuf, u64, Option<Vec<u8>>)>> = HashMap::new();
     // Rebuild the in-memory candidate map from persisted block rows on resume;
     // this also makes repeated indexing safe through deterministic record IDs.
-    let prior_records = load_records(table, "block", Some(scan.key())).await?;
+    let prior_records = load_records(store, "block", Some(scan.key()))?;
     let prior = prior_records
         .iter()
         .map(decode_record::<Block>)
         .collect::<Result<Vec<_>>>()?;
     let mut batch = WriteBatch::new();
     scan.blocks = prior.len() as u64;
-    let prior_file_records = load_records(table, "file", Some(scan.key())).await?;
+    let prior_file_records = load_records(store, "file", Some(scan.key()))?;
     let prior_files = prior_file_records
         .iter()
         .map(decode_record::<ScannedFile>)
@@ -1290,7 +1502,7 @@ async fn run_scan(table: &Table, mut scan: Scan) -> Result<()> {
         let block_count = if file.blocks > 0 {
             file.blocks
         } else {
-            blocks_for_size(size)
+            blocks_for_size(size, sectorsize)
         };
         completed_paths.insert(path_bytes);
         completed_bytes += size;
@@ -1310,8 +1522,7 @@ async fn run_scan(table: &Table, mut scan: Scan) -> Result<()> {
             .or_default()
             .push((absolute, b.offset, b.blake3.clone()));
     }
-    let prior_duplicates = load_records(table, "duplicate", Some(scan.key()))
-        .await?
+    let prior_duplicates = load_records(store, "duplicate", Some(scan.key()))?
         .iter()
         .map(decode_record::<Duplicate>)
         .collect::<Result<Vec<_>>>()
@@ -1343,7 +1554,7 @@ async fn run_scan(table: &Table, mut scan: Scan) -> Result<()> {
         .filter(|(_, relative)| !completed_paths.contains(&path_bytes(relative)))
         .collect();
     scan_files_parallel(
-        table,
+        store,
         &source,
         &mut scan,
         &mut buckets,
@@ -1351,12 +1562,13 @@ async fn run_scan(table: &Table, mut scan: Scan) -> Result<()> {
         &mut completed_paths,
         &mut batch,
         pending_files,
+        sectorsize,
     )
     .await?;
-    batch.flush(table, &scan).await?;
+    batch.flush(store, &scan).await?;
     progress.draw(true)?;
     scan.state = "complete".into();
-    write_scan(table, &scan).await?;
+    write_scan(store, &scan)?;
     Ok(())
 }
 
@@ -1365,6 +1577,7 @@ fn inventory_directory(
     dir: &Path,
     source_root: &Path,
     source_mount_id: u64,
+    sectorsize: u64,
     inventory: &mut Inventory,
 ) -> Result<()> {
     for entry in fs::read_dir(dir)? {
@@ -1385,15 +1598,23 @@ fn inventory_directory(
             continue;
         }
         if metadata.is_dir() {
-            inventory_directory(root, &path, source_root, source_mount_id, inventory)?;
+            inventory_directory(
+                root,
+                &path,
+                source_root,
+                source_mount_id,
+                sectorsize,
+                inventory,
+            )?;
         } else if metadata.is_file() {
             let size = metadata.len();
-            if block_decision_function(size) == BlockDecision::Exclude {
+            let block_count = blocks_for_size(size, sectorsize);
+            if block_count == 0 {
                 continue;
             }
             inventory.files += 1;
             inventory.bytes += size;
-            inventory.blocks += blocks_for_size(size);
+            inventory.blocks += block_count;
             inventory.paths.push((path.clone(), relative.to_path_buf()));
             if io::stderr().is_terminal()
                 && inventory
@@ -1442,19 +1663,21 @@ fn mount_id(path: &Path) -> Result<Option<u64>> {
     Ok(Some(stat.stx_mnt_id))
 }
 
-fn blocks_for_size(size: u64) -> u64 {
-    if size == 0 {
+fn blocks_for_size(size: u64, sectorsize: u64) -> u64 {
+    if sectorsize == 0 {
         return 0;
     }
+    let aligned_size = size - size % sectorsize;
     match block_decision_function(size) {
         BlockDecision::Exclude => 0,
-        BlockDecision::WholeFile => 1,
-        BlockDecision::FixedChunks(chunk_size) => size.div_ceil(chunk_size as u64),
+        BlockDecision::WholeFile if aligned_size > 0 => 1,
+        BlockDecision::WholeFile => 0,
+        BlockDecision::FixedChunks(chunk_size) => aligned_size.div_ceil(chunk_size as u64),
     }
 }
 
 async fn scan_files_parallel(
-    table: &Table,
+    store: &Store,
     source: &Path,
     scan: &mut Scan,
     buckets: &mut HashMap<(usize, u64), Vec<(PathBuf, u64, Option<Vec<u8>>)>>,
@@ -1462,17 +1685,21 @@ async fn scan_files_parallel(
     completed_paths: &mut HashSet<Vec<u8>>,
     batch: &mut WriteBatch,
     pending_files: Vec<(PathBuf, PathBuf)>,
+    sectorsize: u64,
 ) -> Result<()> {
     let available = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(2);
     let worker_count = available.saturating_sub(1).max(1).min(8);
-    println!("Hashing files with {worker_count} workers (reserving one core where possible).");
+    println!(
+        "Scan hashing: up to {worker_count} file batches run at once; each batch reads files and calculates XXH3 hashes. Batches may finish out of order."
+    );
 
     let mut jobs: VecDeque<_> = pending_files.into();
     let bytes_read = Arc::new(AtomicU64::new(progress.bytes));
     let mut workers = tokio::task::JoinSet::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(200));
+    let mut next_batch_id = 1usize;
 
     while !jobs.is_empty() || !workers.is_empty() {
         while workers.len() < worker_count {
@@ -1483,35 +1710,63 @@ async fn scan_files_parallel(
                 .drain(..jobs.len().min(HASH_WORKER_BATCH_FILES))
                 .collect::<Vec<_>>();
             let bytes_read = Arc::clone(&bytes_read);
-            let worker_table = table.clone();
+            let worker_store = store.clone();
             let scan_id = scan.key().to_owned();
+            let batch_id = next_batch_id;
+            next_batch_id += 1;
+            println!(
+                "Scan batch {batch_id}: starting XXH3 hashing for {} files in one background worker (up to {worker_count} batches run concurrently).",
+                worker_jobs.len()
+            );
             workers.spawn(async move {
                 let hashed_files = tokio::task::spawn_blocking(move || {
                     worker_jobs
                         .into_iter()
-                        .map(|(path, relative)| hash_file(path, relative, Arc::clone(&bytes_read)))
+                        .map(|(path, relative)| {
+                            hash_file(path, relative, Arc::clone(&bytes_read), sectorsize)
+                        })
                         .collect::<std::io::Result<Vec<_>>>()
                 })
                 .await
                 .map_err(|error| error.to_string())?
                 .map_err(|error| error.to_string())?;
-                persist_hashed_blocks(&worker_table, &scan_id, &hashed_files).await?;
-                Ok::<_, String>(hashed_files)
+                println!(
+                    "Scan batch {batch_id}: XXH3 hashing finished for {} files; next, save their block hashes to SQLite.",
+                    hashed_files.len()
+                );
+                persist_hashed_blocks(&worker_store, &scan_id, &hashed_files).await?;
+                println!(
+                    "Scan batch {batch_id}: block hashes saved; next, check possible duplicates and update the index in order."
+                );
+                Ok::<_, String>((batch_id, hashed_files))
             });
         }
         tokio::select! {
             joined = workers.join_next(), if !workers.is_empty() => {
-                let hashed_files = joined
+                let (batch_id, hashed_files) = joined
                     .ok_or("hash worker stopped unexpectedly")?
                     .map_err(|error| error.to_string())?
                     .map_err(std::io::Error::other)?;
                 progress.bytes = bytes_read.load(Ordering::Relaxed);
+                let files_count = hashed_files.len();
+                let blocks_before = progress.blocks;
+                let duplicates_before = progress.duplicates;
+                let strong_hashes =
+                    hash_candidate_ranges_parallel(batch_id, &hashed_files, buckets).await?;
                 for hashed in hashed_files {
                     let writable = source.join(&hashed.relative);
                     let relative_bytes = path_bytes(&hashed.relative);
                     let file_key = file_id(scan.key(), &relative_bytes);
-                    let blocks_before = progress.blocks;
-                    index_hashed_file(scan, &hashed, &writable, buckets, progress, batch)?;
+                    let file_blocks_before = progress.blocks;
+                    index_hashed_file(
+                        scan,
+                        &hashed,
+                        &writable,
+                        buckets,
+                        &strong_hashes,
+                        progress,
+                        batch,
+                    )?;
                     progress.files += 1;
                     scan.files = progress.files;
                     scan.blocks = progress.blocks;
@@ -1519,14 +1774,19 @@ async fn scan_files_parallel(
                         scan: scan.key().to_owned(),
                         path: relative_bytes.clone(),
                         bytes: hashed.size,
-                        blocks: progress.blocks - blocks_before,
+                        blocks: progress.blocks - file_blocks_before,
                     });
                     completed_paths.insert(relative_bytes);
                     progress.draw(false)?;
                     if batch.last_flush.elapsed() >= Duration::from_secs(30) {
-                        batch.flush(table, scan).await?;
+                        batch.flush(store, scan).await?;
                     }
                 }
+                println!(
+                    "Scan batch {batch_id}: updated the index for {files_count} files and {} blocks; found {} duplicate ranges. Index updates and dedupe ioctls run sequentially.",
+                    progress.blocks - blocks_before,
+                    progress.duplicates - duplicates_before
+                );
             }
             _ = ticker.tick() => {
                 progress.bytes = bytes_read.load(Ordering::Relaxed);
@@ -1539,7 +1799,7 @@ async fn scan_files_parallel(
 }
 
 async fn persist_hashed_blocks(
-    table: &Table,
+    store: &Store,
     scan_id: &str,
     files: &[HashedFile],
 ) -> std::result::Result<(), String> {
@@ -1571,7 +1831,7 @@ async fn persist_hashed_blocks(
         })
         .collect::<Result<Vec<_>>>()
         .map_err(|error| error.to_string())?;
-    write_records(table, records)
+    write_records_off_thread(store, records)
         .await
         .map_err(|error| error.to_string())
 }
@@ -1580,7 +1840,15 @@ fn hash_file(
     path: PathBuf,
     relative: PathBuf,
     bytes_read: Arc<AtomicU64>,
+    sectorsize: u64,
 ) -> std::io::Result<HashedFile> {
+    if sectorsize == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Btrfs sector size cannot be zero",
+        ));
+    }
+    let sectorsize = usize::try_from(sectorsize).map_err(std::io::Error::other)?;
     let mut file = File::open(&path)?;
     let size = file.metadata()?.len();
     let chunk_size = match block_decision_function(size) {
@@ -1609,13 +1877,16 @@ fn hash_file(
         if len == 0 {
             break;
         }
-        let mut hasher = XxHash3_64::default();
-        hasher.write(&buffer[..len]);
-        blocks.push(HashedBlock {
-            offset,
-            len,
-            xxh3: hasher.finish(),
-        });
+        let aligned_len = len - len % sectorsize;
+        if aligned_len > 0 {
+            let mut hasher = XxHash3_64::default();
+            hasher.write(&buffer[..aligned_len]);
+            blocks.push(HashedBlock {
+                offset,
+                len: aligned_len,
+                xxh3: hasher.finish(),
+            });
+        }
         offset += len as u64;
     }
     Ok(HashedFile {
@@ -1626,11 +1897,95 @@ fn hash_file(
     })
 }
 
+async fn hash_candidate_ranges_parallel(
+    batch_id: usize,
+    files: &[HashedFile],
+    buckets: &HashMap<(usize, u64), Vec<(PathBuf, u64, Option<Vec<u8>>)>>,
+) -> Result<HashMap<(PathBuf, u64), Vec<u8>>> {
+    let mut current_counts = HashMap::new();
+    for block in files.iter().flat_map(|file| &file.blocks) {
+        *current_counts
+            .entry((block.len, block.xxh3))
+            .or_insert(0usize) += 1;
+    }
+
+    let mut ranges = HashMap::new();
+    for file in files {
+        for block in &file.blocks {
+            let key = (block.len, block.xxh3);
+            let members = buckets.get(&key);
+            let has_other_candidate = members.is_some_and(|members| {
+                members
+                    .iter()
+                    .any(|member| member.0 != file.path || member.1 != block.offset)
+            });
+            if !has_other_candidate && current_counts[&key] < 2 {
+                continue;
+            }
+
+            ranges.insert((file.path.clone(), block.offset), block.len);
+            if let Some(members) = members {
+                for member in members.iter().filter(|member| member.2.is_none()) {
+                    ranges.insert((member.0.clone(), member.1), block.len);
+                }
+            }
+        }
+    }
+
+    if ranges.is_empty() {
+        println!(
+            "Scan batch {batch_id}: no possible duplicate ranges; skipping BLAKE3 verification and continuing to ordered indexing."
+        );
+        return Ok(HashMap::new());
+    }
+
+    let ranges = ranges.into_iter().collect::<Vec<_>>();
+    let available = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(2);
+    let worker_count = available.saturating_sub(1).max(1).min(8).min(ranges.len());
+    let chunk_size = ranges.len().div_ceil(worker_count);
+    println!(
+        "Scan batch {batch_id}: confirming {} possible matches with BLAKE3 on {worker_count} workers; then update the duplicate index in order.",
+        ranges.len()
+    );
+    let mut workers = tokio::task::JoinSet::new();
+    for chunk in ranges.chunks(chunk_size) {
+        let chunk = chunk.to_vec();
+        workers.spawn_blocking(move || {
+            chunk
+                .into_iter()
+                .map(|((path, offset), len)| {
+                    hash_range(&path, offset, len)
+                        .map(|digest| ((path, offset), digest))
+                        .map_err(|error| error.to_string())
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()
+        });
+    }
+
+    let mut hashes = HashMap::with_capacity(ranges.len());
+    while let Some(result) = workers.join_next().await {
+        let chunk_hashes = result
+            .map_err(std::io::Error::other)?
+            .map_err(std::io::Error::other)?;
+        for (range, digest) in chunk_hashes {
+            hashes.insert(range, digest);
+        }
+    }
+    println!(
+        "Scan batch {batch_id}: confirmed {} candidate ranges; now update the duplicate index and, unless dry-run, issue dedupe ioctls sequentially.",
+        hashes.len()
+    );
+    Ok(hashes)
+}
+
 fn index_hashed_file(
     scan: &mut Scan,
     file: &HashedFile,
     writable: &Path,
     buckets: &mut HashMap<(usize, u64), Vec<(PathBuf, u64, Option<Vec<u8>>)>>,
+    strong_hashes: &HashMap<(PathBuf, u64), Vec<u8>>,
     progress: &mut ScanProgress,
     batch: &mut WriteBatch,
 ) -> Result<()> {
@@ -1651,10 +2006,16 @@ fn index_hashed_file(
         let strong = if !has_other_candidate {
             same_block
         } else {
-            let digest = hash_range(&file.path, offset, len)?;
+            let digest = strong_hashes
+                .get(&(file.path.clone(), offset))
+                .cloned()
+                .ok_or("candidate range was not strong-hashed")?;
             if members.iter().any(|m| m.2.is_none()) {
                 for member in members.iter_mut().filter(|m| m.2.is_none()) {
-                    let old_digest = hash_range(&member.0, member.1, len)?;
+                    let old_digest = strong_hashes
+                        .get(&(member.0.clone(), member.1))
+                        .cloned()
+                        .ok_or("existing candidate range was not strong-hashed")?;
                     member.2 = Some(old_digest.clone());
                     let old_relative = member.0.strip_prefix(&scan.snapshot)?;
                     let old_id =
@@ -1735,8 +2096,8 @@ fn index_hashed_file(
                 progress.duplicate_bytes += len as u64;
                 let relative = candidate_snapshot.strip_prefix(&scan.snapshot)?;
                 let candidate_live = PathBuf::from(&scan.source).join(relative);
-                let deduped_bytes = if scan.dry_run {
-                    0
+                let (deduped_bytes, commited) = if scan.dry_run {
+                    (0, false)
                 } else {
                     match dedupe_live_ranges(
                         writable,
@@ -1745,8 +2106,9 @@ fn index_hashed_file(
                         *candidate_offset,
                         len,
                     )? {
-                        DedupeOutcome::Deduped(bytes) => bytes,
-                        DedupeOutcome::DataDiffers | DedupeOutcome::Skipped => 0,
+                        DedupeOutcome::Deduped(bytes) => (bytes, true),
+                        DedupeOutcome::AlreadyShared => (0, true),
+                        DedupeOutcome::DataDiffers | DedupeOutcome::Skipped => (0, false),
                     }
                 };
                 let duplicate_path = path_bytes(&file.relative);
@@ -1762,6 +2124,7 @@ fn index_hashed_file(
                         len: len as u64,
                         deduped_bytes,
                         dry_run: scan.dry_run,
+                        commited,
                     },
                 );
             }
@@ -1818,8 +2181,31 @@ fn source_label(source: &Path) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DedupeOutcome {
     Deduped(u64),
+    AlreadyShared,
     DataDiffers,
     Skipped,
+}
+
+fn dedupe_chunk_lengths(len: u64, sectorsize: u64) -> Result<Vec<u64>> {
+    if sectorsize == 0 {
+        return Err("Btrfs reported a zero-byte sector size".into());
+    }
+    let max_chunk = MAX_DEDUPE_IOCTL_LEN - MAX_DEDUPE_IOCTL_LEN % sectorsize;
+    if max_chunk == 0 {
+        return Err(format!(
+            "Btrfs sector size {sectorsize} exceeds the maximum dedupe ioctl range"
+        )
+        .into());
+    }
+    let aligned_len = len - len % sectorsize;
+    let mut chunks = Vec::new();
+    let mut remaining = aligned_len;
+    while remaining > 0 {
+        let chunk = remaining.min(max_chunk);
+        chunks.push(chunk);
+        remaining -= chunk;
+    }
+    Ok(chunks)
 }
 
 fn dedupe_live_ranges(
@@ -1829,23 +2215,81 @@ fn dedupe_live_ranges(
     dest_offset: u64,
     len: usize,
 ) -> Result<DedupeOutcome> {
-    if len % 4096 != 0 || source_path == dest_path && source_offset == dest_offset {
+    if len == 0 {
         return Ok(DedupeOutcome::Skipped);
     }
     let source = File::open(source_path)?;
     let dest = File::options().read(true).write(true).open(dest_path)?;
+    let source_metadata = source.metadata()?;
+    let dest_metadata = dest.metadata()?;
+    if !source_metadata.is_file() || !dest_metadata.is_file() {
+        return Err("dedupe source and target must both be regular files".into());
+    }
+    if source_metadata.dev() != dest_metadata.dev() {
+        return Err("dedupe source and target are on different filesystems".into());
+    }
+    if source_metadata.ino() == dest_metadata.ino() {
+        return if source_offset == dest_offset {
+            Ok(DedupeOutcome::AlreadyShared)
+        } else {
+            Ok(DedupeOutcome::Skipped)
+        };
+    }
+    let sectorsize = filesystem_info(source.as_fd())?.sectorsize as u64;
+    if sectorsize == 0 {
+        return Err("Btrfs reported a zero-byte sector size".into());
+    }
+    if source_offset % sectorsize != 0 || dest_offset % sectorsize != 0 {
+        return Ok(DedupeOutcome::Skipped);
+    }
+    let chunks = dedupe_chunk_lengths(u64::try_from(len)?, sectorsize)?;
+    if chunks.is_empty() {
+        return Ok(DedupeOutcome::Skipped);
+    }
+    let aligned_len = chunks.iter().sum::<u64>();
+    let source_end = source_offset
+        .checked_add(aligned_len)
+        .ok_or("dedupe source range overflows")?;
+    let dest_end = dest_offset
+        .checked_add(aligned_len)
+        .ok_or("dedupe target range overflows")?;
+    if source_end > source_metadata.len() || dest_end > dest_metadata.len() {
+        return Err(format!(
+            "dedupe range exceeds live file size (source ends at {source_end} of {}, target ends at {dest_end} of {})",
+            source_metadata.len(),
+            dest_metadata.len()
+        )
+        .into());
+    }
     // SAFETY: `dest` remains open until after the ioctl returns.
     let dest_fd = unsafe { BorrowedFd::borrow_raw(dest.as_raw_fd()) };
-    let targets = [DedupeTarget {
-        fd: dest_fd,
-        logical_offset: dest_offset,
-    }];
-    let results = file_extent_same(source.as_fd(), source_offset, len as u64, &targets)?;
-    match results[0] {
-        DedupeResult::Deduped(bytes) => Ok(DedupeOutcome::Deduped(bytes)),
-        DedupeResult::DataDiffers => Ok(DedupeOutcome::DataDiffers),
-        DedupeResult::Error(code) => Err(format!("Btrfs dedupe target error: {code}").into()),
+    let mut total_deduped = 0u64;
+    let mut offset = 0u64;
+    for chunk_len in chunks {
+        let targets = [DedupeTarget {
+            fd: dest_fd,
+            logical_offset: dest_offset + offset,
+        }];
+        let results =
+            file_extent_same(source.as_fd(), source_offset + offset, chunk_len, &targets)?;
+        match results[0] {
+            DedupeResult::Deduped(bytes) => {
+                total_deduped = total_deduped.saturating_add(bytes);
+            }
+            DedupeResult::DataDiffers => return Ok(DedupeOutcome::DataDiffers),
+            DedupeResult::Error(code) => {
+                return Err(format!(
+                    "Btrfs dedupe target error: {code} at source offset {} and target offset {} for {} bytes",
+                    source_offset + offset,
+                    dest_offset + offset,
+                    chunk_len
+                )
+                .into());
+            }
+        }
+        offset += chunk_len;
     }
+    Ok(DedupeOutcome::Deduped(total_deduped))
 }
 
 fn verify_duplicates(scan: &Scan, duplicates: &[Duplicate]) -> Result<()> {
@@ -1967,16 +2411,7 @@ fn verify_duplicates(scan: &Scan, duplicates: &[Duplicate]) -> Result<()> {
     Ok(())
 }
 
-async fn commit_duplicates(table: &Table, scan: &Scan, duplicates: &[Duplicate]) -> Result<()> {
-    if scan.state != "complete" {
-        return Err(format!(
-            "cannot commit scan {} while its state is {:?}; only completed scans can be committed",
-            scan.key(),
-            scan.state
-        )
-        .into());
-    }
-
+async fn commit_duplicates(store: &Store, scan: &Scan, duplicates: &[Duplicate]) -> Result<()> {
     let root = PathBuf::from(&scan.source);
     let mounted_root = resolve_btrfs_mount(&root)?;
     let canonical_root = fs::canonicalize(&root)?;
@@ -1989,24 +2424,29 @@ async fn commit_duplicates(table: &Table, scan: &Scan, duplicates: &[Duplicate])
         .into());
     }
 
-    let total_bytes = duplicates
+    let pending_duplicates = duplicates
+        .iter()
+        .filter(|duplicate| !duplicate.commited)
+        .cloned()
+        .collect::<Vec<_>>();
+    let total_bytes = pending_duplicates
         .iter()
         .fold(0u64, |total, duplicate| total.saturating_add(duplicate.len));
     let inventory = Inventory {
-        files: duplicates.len() as u64,
-        blocks: duplicates.len() as u64,
+        files: pending_duplicates.len() as u64,
+        blocks: pending_duplicates.len() as u64,
         bytes: total_bytes,
         ..Inventory::default()
     };
     let mut progress = ScanProgress::new(&inventory, 0, 0, 0, 0, 0, ProgressMode::Commit);
     progress.draw(true)?;
-    let mut committed_pairs = 0u64;
-    let mut committed_bytes = 0u64;
+    let mut commited_pairs = 0u64;
+    let mut commited_bytes = 0u64;
     let mut mismatches = 0u64;
     let mut errors = 0u64;
     let mut pending_records = Vec::with_capacity(512);
 
-    for mut duplicate in duplicates.iter().cloned() {
+    for mut duplicate in pending_duplicates {
         let duplicate_path = PathBuf::from(std::ffi::OsString::from_vec(
             duplicate.duplicate_path.clone(),
         ));
@@ -2054,20 +2494,31 @@ async fn commit_duplicates(table: &Table, scan: &Scan, duplicates: &[Duplicate])
         ) {
             Ok(DedupeOutcome::Deduped(bytes)) => {
                 duplicate.deduped_bytes = bytes;
-                committed_pairs += 1;
-                committed_bytes = committed_bytes.saturating_add(bytes);
+                duplicate.commited = true;
+                commited_pairs += 1;
+                commited_bytes = commited_bytes.saturating_add(bytes);
                 progress.successful_pairs += 1;
                 progress.duplicate_bytes = progress.duplicate_bytes.saturating_add(bytes);
-                pending_records.push(stored_record(
+                pending_records.push(stored_duplicate_record(
                     &duplicate_id(
                         scan.key(),
                         &duplicate.duplicate_path,
                         duplicate.duplicate_offset,
                     ),
-                    "duplicate",
-                    scan.key(),
-                    0,
-                    &[],
+                    &duplicate,
+                )?);
+            }
+            Ok(DedupeOutcome::AlreadyShared) => {
+                duplicate.deduped_bytes = 0;
+                duplicate.commited = true;
+                commited_pairs += 1;
+                progress.successful_pairs += 1;
+                pending_records.push(stored_duplicate_record(
+                    &duplicate_id(
+                        scan.key(),
+                        &duplicate.duplicate_path,
+                        duplicate.duplicate_offset,
+                    ),
                     &duplicate,
                 )?);
             }
@@ -2083,41 +2534,32 @@ async fn commit_duplicates(table: &Table, scan: &Scan, duplicates: &[Duplicate])
                     duplicate.source_offset,
                     duplicate.len
                 ))?;
-                pending_records.push(stored_record(
+                pending_records.push(stored_duplicate_record(
                     &duplicate_id(
                         scan.key(),
                         &duplicate.duplicate_path,
                         duplicate.duplicate_offset,
                     ),
-                    "duplicate",
-                    scan.key(),
-                    0,
-                    &[],
                     &duplicate,
                 )?);
             }
             Ok(DedupeOutcome::Skipped) => {
-                errors += 1;
                 progress.duplicates += 1;
                 duplicate.deduped_bytes = 0;
                 progress.log(format!(
-                    "ANOMALY skipped unsupported range: {} @ {} vs {} @ {} ({} bytes; ranges must be sector-aligned and distinct)",
+                    "Skipped range unsupported for dedupe: {} @ {} vs {} @ {} ({} bytes; no full aligned range or source and target are the same file)",
                     duplicate_path.display(),
                     duplicate.duplicate_offset,
                     source_path.display(),
                     duplicate.source_offset,
                     duplicate.len
                 ))?;
-                pending_records.push(stored_record(
+                pending_records.push(stored_duplicate_record(
                     &duplicate_id(
                         scan.key(),
                         &duplicate.duplicate_path,
                         duplicate.duplicate_offset,
                     ),
-                    "duplicate",
-                    scan.key(),
-                    0,
-                    &[],
                     &duplicate,
                 )?);
             }
@@ -2137,18 +2579,18 @@ async fn commit_duplicates(table: &Table, scan: &Scan, duplicates: &[Duplicate])
         progress.bytes = progress.bytes.saturating_add(duplicate.len);
         update_pair_progress(&mut progress)?;
         if pending_records.len() >= 512 {
-            write_records(table, std::mem::take(&mut pending_records)).await?;
+            write_records_off_thread(store, std::mem::take(&mut pending_records)).await?;
         }
     }
     if !pending_records.is_empty() {
-        write_records(table, pending_records).await?;
+        write_records_off_thread(store, pending_records).await?;
     }
     progress.draw(true)?;
     println!(
         "Commit for scan {}: deduped_pairs={}, deduped={}, mismatches={}, errors={}",
         scan.key(),
-        committed_pairs,
-        format_bytes(committed_bytes),
+        commited_pairs,
+        format_bytes(commited_bytes),
         mismatches,
         errors
     );
@@ -2277,6 +2719,20 @@ mod tests {
     }
 
     #[test]
+    fn database_path_option_before_gui_leaves_gui_as_the_command() {
+        let mut arguments = vec![
+            "--db".into(),
+            "/e/space/btrfs-dup.sqlite".into(),
+            "gui".into(),
+        ];
+
+        let path = take_db_path(&mut arguments).expect("parse database path");
+
+        assert_eq!(path, PathBuf::from("/e/space/btrfs-dup.sqlite"));
+        assert_eq!(arguments, vec!["gui"]);
+    }
+
+    #[test]
     fn database_option_does_not_consume_command_as_its_path() {
         let mut arguments = vec!["--db".into(), "list".into()];
 
@@ -2284,16 +2740,13 @@ mod tests {
     }
 
     #[test]
-    fn block_index_key_is_u64_hash_of_length_and_xxh3_tuple() {
+    fn block_record_preserves_xxh3_and_length() {
         let length = 4096u64;
         let hash = 0x0102_0304_0506_0708u64.to_be_bytes();
         let record = stored_record("id", "block", "scan", length, &hash, &"payload")
             .expect("serialize block row");
 
-        let mut expected = XxHash3_64::default();
-        expected.write(&length.to_be_bytes());
-        expected.write(&hash);
-        assert_eq!(record.hash_key, expected.finish());
+        assert_eq!(record.len, length);
         assert_eq!(record.xxh3, u64::from_be_bytes(hash));
     }
 
@@ -2308,6 +2761,142 @@ mod tests {
         assert_ne!(file, duplicate);
     }
 
+    #[test]
+    fn sqlite_creates_scan_and_block_composite_indexes() {
+        let path = std::env::temp_dir().join(format!(
+            "btrfs-dup-index-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        let store = open_store(&path).expect("open temporary SQLite database");
+        let connection = store.connection.lock().expect("lock SQLite connection");
+        for (index, expected) in [
+            ("records_kind_scan_id", vec!["kind", "scan", "id"]),
+            ("records_block_match", vec!["kind", "scan", "len", "xxh3"]),
+            (
+                "records_pending_duplicates",
+                vec!["kind", "scan", "commited", "id"],
+            ),
+        ] {
+            let mut statement = connection
+                .prepare(&format!("PRAGMA index_info({index})"))
+                .expect("prepare index info query");
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(2))
+                .expect("query index columns")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("read index columns");
+            assert_eq!(columns, expected);
+        }
+        drop(connection);
+        drop(store);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pending_duplicate_query_excludes_commited_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "btrfs-dup-pending-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        let store = open_store(&path).expect("open temporary SQLite database");
+        let mut duplicate = Duplicate {
+            scan: "scan-1".into(),
+            duplicate_path: b"duplicate".to_vec(),
+            duplicate_offset: 0,
+            source_path: b"source".to_vec(),
+            source_offset: 0,
+            len: 4096,
+            deduped_bytes: 0,
+            dry_run: false,
+            commited: false,
+        };
+        let pending_row =
+            stored_duplicate_record("dup-pending", &duplicate).expect("encode pending row");
+        duplicate.duplicate_path = b"already-deduped".to_vec();
+        duplicate.commited = true;
+        duplicate.deduped_bytes = 3072;
+        let commited_row =
+            stored_duplicate_record("dup-commited", &duplicate).expect("encode commited row");
+        write_records(&store, vec![pending_row, commited_row]).expect("write duplicates");
+
+        let duplicates =
+            load_pending_duplicates(&store, "scan-1").expect("load pending duplicates");
+        assert_eq!(duplicates.len(), 1);
+        assert!(!duplicates[0].commited);
+        assert_eq!(duplicates[0].duplicate_path, b"duplicate");
+        let stats = load_duplicate_stats(&store, "scan-1").expect("load duplicate stats");
+        assert_eq!(
+            stats,
+            ScanDuplicateStats {
+                commited: DuplicateStats {
+                    pairs: 1,
+                    range_bytes: 4096,
+                    deduped_bytes: 3072,
+                },
+                uncommited: DuplicateStats {
+                    pairs: 1,
+                    range_bytes: 4096,
+                    deduped_bytes: 0,
+                },
+            }
+        );
+
+        drop(store);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn deleting_scan_records_keeps_other_scans_intact() {
+        let path = std::env::temp_dir().join(format!(
+            "btrfs-dup-finish-delete-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        let store = open_store(&path).expect("open temporary SQLite database");
+        let records = vec![
+            stored_record("scan:one", "scan", "one", 0, &[], &"scan one").expect("encode scan one"),
+            stored_record("block:one", "block", "one", 4096, &[], &"block one")
+                .expect("encode block one"),
+            stored_record("scan:two", "scan", "two", 0, &[], &"scan two").expect("encode scan two"),
+        ];
+        write_records(&store, records).expect("write test records");
+
+        assert_eq!(
+            delete_scan_records(&store, "one").expect("delete scan one"),
+            2
+        );
+        assert!(
+            load_records(&store, "scan", Some("one"))
+                .expect("query deleted scan")
+                .is_empty()
+        );
+        assert!(
+            load_records(&store, "block", Some("one"))
+                .expect("query deleted blocks")
+                .is_empty()
+        );
+        assert_eq!(
+            load_records(&store, "scan", Some("two"))
+                .expect("query scan two")
+                .len(),
+            1
+        );
+
+        drop(store);
+        let _ = fs::remove_file(path);
+    }
+
     #[tokio::test]
     async fn write_batch_flushes_stable_record_ids() {
         let path = std::env::temp_dir().join(format!(
@@ -2318,9 +2907,7 @@ mod tests {
                 .expect("system clock")
                 .as_nanos()
         ));
-        let table = open_store(&path)
-            .await
-            .expect("open temporary LanceDB table");
+        let store = open_store(&path).expect("open temporary SQLite database");
         let scan = Scan {
             scan_id: Some("scan-1".into()),
             source: "/source".into(),
@@ -2335,7 +2922,7 @@ mod tests {
             "block-1".into(),
             Block {
                 scan: "scan-1".into(),
-                xxh3: 1,
+                xxh3: u64::MAX,
                 len: 4096,
                 path: b"file".to_vec(),
                 offset: 0,
@@ -2351,11 +2938,18 @@ mod tests {
                 blocks: 1,
             },
         );
-        batch.flush(&table, &scan).await.expect("flush batch");
-        let blocks = load_records(&table, "block", Some("scan-1"))
-            .await
-            .expect("load persisted blocks");
-        assert!(blocks.iter().any(|row| row.id == "block-1"));
+        batch.flush(&store, &scan).await.expect("flush batch");
+        let blocks = load_records(&store, "block", Some("scan-1")).expect("load persisted blocks");
+        let first_block = blocks
+            .iter()
+            .find(|row| row.id == "block-1")
+            .expect("first block row exists");
+        assert_eq!(
+            decode_record::<Block>(first_block)
+                .expect("decode first block")
+                .xxh3,
+            u64::MAX
+        );
         let hashed = [HashedFile {
             path: PathBuf::from("/snapshot/worker-file"),
             relative: PathBuf::from("worker-file"),
@@ -2366,12 +2960,11 @@ mod tests {
                 xxh3: 2,
             }],
         }];
-        persist_hashed_blocks(&table, "scan-1", &hashed)
+        persist_hashed_blocks(&store, "scan-1", &hashed)
             .await
             .expect("persist worker block batch");
         let worker_block_id = block_id("scan-1", b"worker-file", 0);
-        let worker_block = load_records(&table, "block", Some("scan-1"))
-            .await
+        let worker_block = load_records(&store, "block", Some("scan-1"))
             .expect("load worker block")
             .into_iter()
             .find(|row| row.id == worker_block_id)
@@ -2382,8 +2975,63 @@ mod tests {
                 .len,
             4096
         );
-        drop(table);
-        let _ = fs::remove_dir_all(path);
+        assert_eq!(
+            decode_record::<Block>(&worker_block)
+                .expect("decode block")
+                .xxh3,
+            2
+        );
+        drop(store);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn candidate_ranges_are_strong_hashed_in_parallel_batches() {
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        );
+        let current_path = std::env::temp_dir().join(format!("btrfs-dup-current-{suffix}"));
+        let existing_path = std::env::temp_dir().join(format!("btrfs-dup-existing-{suffix}"));
+        let current_contents = vec![0x3a; 4096];
+        let existing_contents = vec![0xa5; 4096];
+        fs::write(&current_path, &current_contents).expect("write current candidate");
+        fs::write(&existing_path, &existing_contents).expect("write existing candidate");
+
+        let file = HashedFile {
+            path: current_path.clone(),
+            relative: PathBuf::from("current"),
+            size: current_contents.len() as u64,
+            blocks: vec![HashedBlock {
+                offset: 0,
+                len: current_contents.len(),
+                xxh3: 7,
+            }],
+        };
+        let buckets = HashMap::from([(
+            (current_contents.len(), 7),
+            vec![(existing_path.clone(), 0, None)],
+        )]);
+
+        let hashes = hash_candidate_ranges_parallel(1, &[file], &buckets)
+            .await
+            .expect("hash candidate ranges");
+
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(
+            hashes.get(&(current_path.clone(), 0)),
+            Some(&blake3::hash(&current_contents).as_bytes().to_vec())
+        );
+        assert_eq!(
+            hashes.get(&(existing_path.clone(), 0)),
+            Some(&blake3::hash(&existing_contents).as_bytes().to_vec())
+        );
+        fs::remove_file(current_path).expect("remove current candidate");
+        fs::remove_file(existing_path).expect("remove existing candidate");
     }
 
     #[test]
@@ -2396,26 +3044,69 @@ mod tests {
 
     #[test]
     fn block_decision_function_uses_requested_tiers() {
-        assert_eq!(blocks_for_size(0), 0);
+        assert_eq!(blocks_for_size(0, 4096), 0);
         assert_eq!(block_decision_function(0), BlockDecision::Exclude);
         assert_eq!(block_decision_function(2 * MIB - 1), BlockDecision::Exclude);
         assert_eq!(block_decision_function(2 * MIB), BlockDecision::WholeFile);
         assert_eq!(
-            block_decision_function(10 * MIB - 1),
+            block_decision_function(BLOCK_CHUNK_SIZE as u64 - 1),
             BlockDecision::WholeFile
         );
         assert_eq!(
-            block_decision_function(10 * MIB),
-            BlockDecision::FixedChunks(TEN_MIB)
+            block_decision_function(BLOCK_CHUNK_SIZE as u64),
+            BlockDecision::FixedChunks(BLOCK_CHUNK_SIZE)
         );
         assert_eq!(
             block_decision_function(2 * GIB - 1),
-            BlockDecision::FixedChunks(TEN_MIB)
+            BlockDecision::FixedChunks(BLOCK_CHUNK_SIZE)
         );
         assert_eq!(
             block_decision_function(2 * GIB),
-            BlockDecision::FixedChunks(HUNDRED_MIB)
+            BlockDecision::FixedChunks(LARGE_BLOCK_CHUNK_SIZE)
         );
+        assert_eq!(blocks_for_size(2 * MIB + 1, 4096), 1);
+        assert_eq!(blocks_for_size(2 * MIB + 1, 0), 0);
+    }
+
+    #[test]
+    fn hash_file_trims_the_final_block_to_a_full_sector() {
+        let path = std::env::temp_dir().join(format!(
+            "btrfs-dup-aligned-hash-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        File::create(&path)
+            .expect("create sparse test file")
+            .set_len(2 * MIB + 1)
+            .expect("size sparse test file");
+        let hashed = hash_file(
+            path.clone(),
+            PathBuf::from("aligned-test"),
+            Arc::new(AtomicU64::new(0)),
+            4096,
+        )
+        .expect("hash sector-aligned prefix");
+        assert_eq!(hashed.blocks.len(), 1);
+        assert_eq!(hashed.blocks[0].offset, 0);
+        assert_eq!(hashed.blocks[0].len as u64, 2 * MIB);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn dedupe_ioctl_ranges_are_sector_aligned_and_capped() {
+        let chunks = dedupe_chunk_lengths(100 * MIB, 4096).expect("plan dedupe chunks");
+        assert_eq!(chunks.iter().sum::<u64>(), 100 * MIB);
+        assert_eq!(chunks.len(), 7);
+        assert!(chunks.iter().all(|chunk| *chunk <= MAX_DEDUPE_IOCTL_LEN));
+        assert!(chunks.iter().all(|chunk| chunk % 4096 == 0));
+
+        let unaligned = dedupe_chunk_lengths(8_772_223, 4096).expect("align final range");
+        assert_eq!(unaligned.iter().sum::<u64>(), 8_772_223 - 8_772_223 % 4096);
+        assert!(unaligned.iter().all(|chunk| chunk % 4096 == 0));
+        assert!(dedupe_chunk_lengths(4096, 0).is_err());
     }
 }
 impl SeekTo for File {

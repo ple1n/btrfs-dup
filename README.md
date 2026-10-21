@@ -1,12 +1,12 @@
 # btrfs-dup
 
-A minimal Btrfs snapshot scanner and extent deduplicator. The embedded LanceDB
-store defaults to `./btrfs-dup.lance`. Use the global `--db <path>` option to
-choose another store; the path can appear before or after the command. Existing
-SurrealDB data is not migrated or read.
+A minimal Btrfs snapshot scanner and extent deduplicator. The embedded SQLite
+database defaults to `./btrfs-dup.sqlite`. Use the global `--db <path>` option
+to choose another database file; the path can appear before or after the
+command. Existing LanceDB data is not migrated or read.
 
-Build with the pinned Nix toolchain (including `protoc`, `libclang`, and the
-GTK/WebKit libraries required by the desktop GUI):
+Build with the pinned Nix toolchain (including `libclang` and the GTK/WebKit
+libraries required by the desktop GUI):
 
 ```sh
 nix develop --command cargo build --release
@@ -19,12 +19,14 @@ Run the CLI or build without entering the development shell:
 cargo run --                         # guided start (inside nix develop)
 cargo run -- dedup /mnt/data
 cargo run -- dedup /dev/nvme0n1p2
-cargo run -- --db /var/lib/btrfs-dup.lance dedup /mnt/data
-cargo run -- list --db /var/lib/btrfs-dup.lance
+cargo run -- --db /var/lib/btrfs-dup.sqlite dedup /mnt/data
+cargo run -- list --db /var/lib/btrfs-dup.sqlite
 cargo run -- status <scan-id>
 cargo run -- verify <scan-id>
 cargo run -- commit <scan-id>
-cargo run -- --db /var/lib/btrfs-dup.lance gui
+cargo run -- finish <scan-id>
+cargo run -- finish <scan-id> --delete
+cargo run -- --db /var/lib/btrfs-dup.sqlite gui
 cargo run -- resume <scan-id>
 cargo run -- dedup --resume <scan-id>
 sudo ./target/release/btrfs-dup install
@@ -43,22 +45,20 @@ confirmation before allowing dedupe changes. `--dry-run` selects dry-run mode
 without the prompt.
 
 `dedup` creates a read-only snapshot under `.btrfs-dup-snapshots` in the
-mounted filesystem. Its `block_decision_function` indexes files under 10 MiB
-as whole-file blocks, uses 10 MiB chunks for files from 10 MiB to under 2 GiB,
-and uses 100 MiB chunks for files at least 2 GiB.
+mounted filesystem. Its `block_decision_function` excludes files smaller than
+2 MiB, indexes files from 2 MiB to under 16 MiB as whole-file blocks, uses
+16 MiB chunks for files from 16 MiB to under 2 GiB, and uses 96 MiB chunks
+for files at least 2 GiB. It hashes only sector-aligned block ranges, leaving
+any final sub-sector tail outside the dedupe index.
 XXH3 narrows candidate blocks; BLAKE3 is computed only when blocks with the
 same length and XXH3 collide. Matching `(length, XXH3, BLAKE3)` tuples are
 submitted to the Btrfs extent-deduplication ioctl against the writable source
-subvolume. LanceDB stores scan, block, checkpoint, and duplicate records in
-one table. Since LanceDB does not support composite B-tree indexes, block rows
-store a `UInt64` `hash_key` made by hashing the `(len, xxh3)` tuple and index
-that scalar with a B-tree. The original `len` and XXH3 values remain stored
-separately and are checked as the exact tuple; the derived key is not treated
-as a unique identifier.
-The table also maintains B-tree indexes on `scan` and `id` for scan-scoped
-lookups and stable record upserts, plus a bitmap index on low-cardinality
-`kind` values. When opening an existing database, the CLI creates any missing
-indexes over its existing rows; it does not discard or rewrite saved records.
+subvolume. SQLite stores scan, block, file-checkpoint, and duplicate records
+in one `records` table. Its primary-key B-tree on `id` supports stable upserts;
+composite B-tree indexes on `(kind, scan, id)` and
+`(kind, scan, len, xxh3)` support scan-scoped browsing and exact candidate-key
+lookups. Opening the database creates the table and any missing indexes.
+Existing LanceDB data is not migrated or read.
 
 `--dry-run` still creates the snapshot and persists scan progress/index data,
 but does not call the deduplication ioctl. The snapshot is retained so scans
@@ -66,11 +66,11 @@ can be resumed. `resume` re-walks the immutable snapshot and uses stable
 database record IDs to avoid duplicating indexed block records.
 Resume skips files with persisted completion checkpoints and initializes the
 progress panel from their saved byte and block counts. New block records and
-file checkpoints are buffered and flushed to LanceDB in batches at least
+file checkpoints are buffered and flushed to SQLite in transactions at least
 every 30 seconds and at scan completion; an abrupt stop can require redoing
 work since the latest flush.
 Each worker hashes a group of up to 256 files and commits their block rows in
-one `merge_insert` operation. The coordinator later persists BLAKE3 collision
+one SQLite transaction. The coordinator later persists BLAKE3 collision
 upgrades, duplicate relationships, and completed-file checkpoints in periodic
 batches. A file checkpoint is not written until its candidate processing is
 complete.
@@ -86,26 +86,38 @@ throughput in MB/s or GB/s, elapsed time, files, blocks processed, and
 duplicate blocks found. It logs only XXH3 collisions that BLAKE3 distinguishes;
 confirmed duplicates are counted in the progress display instead.
 `list` shows per-scan counts and totals across all saved scans.
+`status <scan-id>` also reports duplicate-pair counts, candidate range bytes,
+and successfully deduplicated bytes, split into commited and uncommited
+totals.
 Confirmed duplicate block relationships are stored per scan, including both
 relative paths and offsets, candidate length, whether the scan was a dry run,
-and bytes actually reported deduplicated by Btrfs. Resume restores the
-persisted duplicate count and matching-byte total.
+whether the range has been commited, and bytes actually reported deduplicated
+by Btrfs. Resume restores the persisted duplicate count and matching-byte total.
 `verify <scan-id>` rereads each recorded pair from the scan's source filesystem
 and compares their bytes in bounded-memory chunks. It displays scan-style
 progress, logs mismatches or read errors as anomalies, and exits unsuccessfully
 if any pair differs or cannot be read.
-`commit <scan-id>` replays a completed scan's recorded duplicate pairs against
-its saved source mount using Btrfs extent deduplication. Btrfs checks each range
-before sharing extents; mismatches and other anomalies are logged, and successful
-dedupe byte counts are written back to the scan records in batches. Existing
-records are retained.
+`commit <scan-id>` processes persisted, uncommited duplicate pairs even when
+the scan is incomplete, against its saved source mount using Btrfs extent
+deduplication. It only reads rows where `commited = false`, using a composite
+SQLite B-tree index. Ranges are split into sector-aligned requests no larger
+than 16 MiB, and a final sub-sector tail is left untouched. Btrfs checks each
+range before sharing extents; mismatches and other anomalies are logged, and
+successful rows are marked commited with their deduped byte counts. Resume
+and commit can be run later for remaining scan work and duplicate pairs.
+`finish <scan-id>` is allowed only for a complete scan. It removes that scan's
+read-only snapshot and waits for Btrfs to finish cleaning it up, then marks the
+scan finished. The scan's database records are retained by default, but the
+scan can no longer be resumed. Add `--delete` to also delete all database
+records belonging to that scan; this removes its status, duplicate, and index
+data as well.
 `gui` opens a local Dioxus desktop database browser for the selected `--db`
 store. It paginates scan and per-scan record rows; command actions are shown as
 placeholders in the sidebar.
 
-Final chunks are indexed, but dedupe is skipped when their length is not
-sector-aligned. Snapshot creation and dedupe require a Btrfs filesystem and
-appropriate permissions.
+Final chunks are indexed in full; commit deduplicates their largest complete
+sector-aligned prefix. Snapshot creation and dedupe require a Btrfs filesystem
+and appropriate permissions.
 
 `install` copies the running executable to `/usr/local/bin/btrfs-dup` and
 installs a completion script for the shell detected from `$SHELL` under

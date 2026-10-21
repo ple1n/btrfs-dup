@@ -10,10 +10,10 @@ serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 twox-hash = "2.1"
 btrfs-uapi = "0.13.0"
-lancedb = { version = "0.40.0", features = ["remote"] }
 futures = "0.3"
 libc = "0.2"
 dioxus = { version = "0.7.3", default-features = false, features = ["desktop", "lib", "launch"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 
 [profile.release]
 opt-level = 3

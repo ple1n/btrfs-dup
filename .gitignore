@@ -3,3 +3,4 @@ local/
 /btrfs-dup.db/
 /btrfs-dup.lance/
 /btrfs-dup.lance/
+/btrfs-dup.sqlite*
