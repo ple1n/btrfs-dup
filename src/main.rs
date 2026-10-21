@@ -2445,53 +2445,84 @@ async fn commit_duplicates(store: &Store, scan: &Scan, duplicates: &[Duplicate])
     let mut mismatches = 0u64;
     let mut errors = 0u64;
     let mut pending_records = Vec::with_capacity(512);
+    let mut pending_duplicates: VecDeque<_> = pending_duplicates.into();
+    let available = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(2);
+    let worker_count = available.saturating_sub(1).max(1).min(8);
+    println!(
+        "Committing {} pairs with up to {worker_count} concurrent Btrfs workers; results may complete out of order.",
+        pending_duplicates.len()
+    );
+    let mut workers = tokio::task::JoinSet::new();
 
-    for mut duplicate in pending_duplicates {
-        let duplicate_path = PathBuf::from(std::ffi::OsString::from_vec(
-            duplicate.duplicate_path.clone(),
-        ));
-        let source_path =
-            PathBuf::from(std::ffi::OsString::from_vec(duplicate.source_path.clone()));
-        if duplicate.scan != scan.key()
-            || duplicate.len == 0
-            || !safe_relative_path(&duplicate_path)
-            || !safe_relative_path(&source_path)
-        {
-            errors += 1;
-            progress.duplicates += 1;
-            progress.log(format!(
-                "ANOMALY invalid stored duplicate relation: {} @ {} vs {} @ {} ({} bytes)",
-                duplicate_path.display(),
-                duplicate.duplicate_offset,
-                source_path.display(),
-                duplicate.source_offset,
-                duplicate.len
-            ))?;
-            update_pair_progress(&mut progress)?;
-            continue;
-        }
-        let len = match usize::try_from(duplicate.len) {
-            Ok(len) => len,
-            Err(error) => {
+    while !pending_duplicates.is_empty() || !workers.is_empty() {
+        while workers.len() < worker_count {
+            let Some(duplicate) = pending_duplicates.pop_front() else {
+                break;
+            };
+            let duplicate_path = PathBuf::from(std::ffi::OsString::from_vec(
+                duplicate.duplicate_path.clone(),
+            ));
+            let source_path =
+                PathBuf::from(std::ffi::OsString::from_vec(duplicate.source_path.clone()));
+            if duplicate.scan != scan.key()
+                || duplicate.len == 0
+                || !safe_relative_path(&duplicate_path)
+                || !safe_relative_path(&source_path)
+            {
                 errors += 1;
                 progress.duplicates += 1;
                 progress.log(format!(
-                    "ANOMALY invalid duplicate length {}: {error}",
+                    "ANOMALY invalid stored duplicate relation: {} @ {} vs {} @ {} ({} bytes)",
+                    duplicate_path.display(),
+                    duplicate.duplicate_offset,
+                    source_path.display(),
+                    duplicate.source_offset,
                     duplicate.len
                 ))?;
                 update_pair_progress(&mut progress)?;
                 continue;
             }
-        };
-        let duplicate_absolute = root.join(&duplicate_path);
-        let source_absolute = root.join(&source_path);
-        match dedupe_live_ranges(
-            &duplicate_absolute,
-            duplicate.duplicate_offset,
-            &source_absolute,
-            duplicate.source_offset,
-            len,
-        ) {
+            let len = match usize::try_from(duplicate.len) {
+                Ok(len) => len,
+                Err(error) => {
+                    errors += 1;
+                    progress.duplicates += 1;
+                    progress.log(format!(
+                        "ANOMALY invalid duplicate length {}: {error}",
+                        duplicate.len
+                    ))?;
+                    update_pair_progress(&mut progress)?;
+                    continue;
+                }
+            };
+            let duplicate_absolute = root.join(&duplicate_path);
+            let source_absolute = root.join(&source_path);
+            workers.spawn_blocking(move || {
+                let outcome = dedupe_live_ranges(
+                    &duplicate_absolute,
+                    duplicate.duplicate_offset,
+                    &source_absolute,
+                    duplicate.source_offset,
+                    len,
+                )
+                .map_err(|error| error.to_string());
+                (duplicate, outcome)
+            });
+        }
+
+        let (mut duplicate, outcome) = workers
+            .join_next()
+            .await
+            .ok_or("commit worker stopped unexpectedly")?
+            .map_err(std::io::Error::other)?;
+        let duplicate_path = PathBuf::from(std::ffi::OsString::from_vec(
+            duplicate.duplicate_path.clone(),
+        ));
+        let source_path =
+            PathBuf::from(std::ffi::OsString::from_vec(duplicate.source_path.clone()));
+        match outcome {
             Ok(DedupeOutcome::Deduped(bytes)) => {
                 duplicate.deduped_bytes = bytes;
                 duplicate.commited = true;
@@ -2735,6 +2766,13 @@ mod tests {
     #[test]
     fn database_option_does_not_consume_command_as_its_path() {
         let mut arguments = vec!["--db".into(), "list".into()];
+
+        assert!(take_db_path(&mut arguments).is_err());
+    }
+
+    #[test]
+    fn database_option_recognizes_finish_as_a_command() {
+        let mut arguments = vec!["--db".into(), "finish".into(), "scan-1".into()];
 
         assert!(take_db_path(&mut arguments).is_err());
     }

@@ -76,9 +76,11 @@ batches. A file checkpoint is not written until its candidate processing is
 complete.
 
 File reads and XXH3 hashing use a bounded worker pool sized to leave one
-available CPU idle when possible (up to eight workers). Candidate resolution,
-BLAKE3 collision checks, and dedupe operations remain serialized to protect
-the shared index.
+available CPU idle when possible (up to eight workers). BLAKE3 checks for
+possible matches also run in parallel; updates to the shared candidate index
+remain ordered. `commit` runs up to eight independent duplicate-pair ioctls
+concurrently, while splitting each pair into sector-aligned ioctl chunks in
+order.
 
 During a scan, the CLI reports the inventory and saved-index phases, then
 updates one in-place progress bar with scanned bytes, remaining bytes,
