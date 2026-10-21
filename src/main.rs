@@ -686,14 +686,16 @@ fn finish_scan(store: &Store, mut scan: Scan, delete_data: bool) -> Result<()> {
             let snapshot_fd = File::open(&snapshot)?;
             let snapshot_info = subvolume::subvolume_info(snapshot_fd.as_fd())?;
             let parent_info = subvolume::subvolume_info(parent_fd.as_fd())?;
-            if snapshot_info.id == parent_info.id
-                || !snapshot_info
-                    .flags
-                    .contains(subvolume::SubvolumeFlags::RDONLY)
-            {
-                return Err(
-                    "refusing to finish: target is not this scan's read-only Btrfs snapshot".into(),
-                );
+            if snapshot_info.id == parent_info.id {
+                return Err("refusing to finish: target is not a separate Btrfs subvolume".into());
+            }
+            let snapshot_flags = subvolume::subvolume_flags_get(snapshot_fd.as_fd())?;
+            if !snapshot_flags.contains(subvolume::SubvolumeFlags::RDONLY) {
+                return Err(format!(
+                    "refusing to finish: scan subvolume {} is not read-only (reported flags: {snapshot_flags:?})",
+                    snapshot.display()
+                )
+                .into());
             }
             drop(snapshot_fd);
             let snapshot_name = CString::new(snapshot_name)?;
@@ -736,6 +738,207 @@ fn delete_scan_records(store: &Store, scan_id: &str) -> Result<usize> {
     let deleted = transaction.execute("DELETE FROM records WHERE scan = ?1", params![scan_id])?;
     transaction.commit()?;
     Ok(deleted)
+}
+
+fn load_record_scan_ids(store: &Store) -> Result<HashSet<String>> {
+    let connection = store
+        .connection
+        .lock()
+        .map_err(|_| "SQLite connection lock was poisoned")?;
+    let mut statement = connection.prepare("SELECT DISTINCT scan FROM records")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<HashSet<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn cleanup_orphan_snapshots(store: &Store, mount_path: &Path, delete: bool) -> Result<()> {
+    let requested_mount = fs::canonicalize(mount_path)?;
+    let source = resolve_btrfs_mount(&requested_mount)?;
+    let source = fs::canonicalize(source)?;
+    if requested_mount != source {
+        return Err(format!(
+            "provide the mounted Btrfs root, not a subdirectory: {}",
+            requested_mount.display()
+        )
+        .into());
+    }
+
+    let snapshot_dir = source.join(SNAPSHOT_DIR);
+    let snapshot_dir_metadata = match fs::symlink_metadata(&snapshot_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!(
+                "No btrfs-dup snapshot directory exists at {}.",
+                snapshot_dir.display()
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if !snapshot_dir_metadata.is_dir() || snapshot_dir_metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing to inspect non-directory snapshot path {}",
+            snapshot_dir.display()
+        )
+        .into());
+    }
+    let parent_fd = match File::open(&snapshot_dir) {
+        Ok(fd) => fd,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!(
+                "No btrfs-dup snapshot directory exists at {}.",
+                snapshot_dir.display()
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let parent_info = subvolume::subvolume_info(parent_fd.as_fd())?;
+    let known_scan_ids = load_record_scan_ids(store)?;
+    let mut candidates = Vec::new();
+    let mut deleted_count = 0usize;
+    let mut failures = 0usize;
+
+    for entry in fs::read_dir(&snapshot_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(scan_id) = name.strip_prefix(".btrfs-dup-") else {
+            continue;
+        };
+        if scan_id.is_empty() || known_scan_ids.contains(scan_id) {
+            continue;
+        }
+
+        let snapshot_path = entry.path();
+        let metadata = match fs::symlink_metadata(&snapshot_path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                failures += 1;
+                eprintln!(
+                    "Could not inspect possible orphan {}: {error}",
+                    snapshot_path.display()
+                );
+                continue;
+            }
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            failures += 1;
+            eprintln!(
+                "Refusing to process non-directory snapshot candidate {}.",
+                snapshot_path.display()
+            );
+            continue;
+        }
+
+        let snapshot_fd = match File::open(&snapshot_path) {
+            Ok(fd) => fd,
+            Err(error) => {
+                failures += 1;
+                eprintln!(
+                    "Could not open possible orphan {}: {error}",
+                    snapshot_path.display()
+                );
+                continue;
+            }
+        };
+        let info = match subvolume::subvolume_info(snapshot_fd.as_fd()) {
+            Ok(info) => info,
+            Err(error) => {
+                failures += 1;
+                eprintln!(
+                    "Could not verify possible orphan {} as a Btrfs subvolume: {error}",
+                    snapshot_path.display()
+                );
+                continue;
+            }
+        };
+        let flags = match subvolume::subvolume_flags_get(snapshot_fd.as_fd()) {
+            Ok(flags) => flags,
+            Err(error) => {
+                failures += 1;
+                eprintln!(
+                    "Could not read flags for possible orphan {}: {error}",
+                    snapshot_path.display()
+                );
+                continue;
+            }
+        };
+        if info.id == parent_info.id
+            || info.parent_id != parent_info.id
+            || !flags.contains(subvolume::SubvolumeFlags::RDONLY)
+        {
+            failures += 1;
+            eprintln!(
+                "Refusing to process {}: it is not a direct read-only snapshot of this directory (id={}, parent_id={}, flags={flags:?}).",
+                snapshot_path.display(),
+                info.id,
+                info.parent_id
+            );
+            continue;
+        }
+
+        drop(snapshot_fd);
+        candidates.push((name.to_owned(), snapshot_path, info.id));
+    }
+
+    if delete {
+        println!(
+            "Found {} orphan snapshots to delete; submitting all removals to Btrfs without waiting for background extent cleanup.",
+            candidates.len()
+        );
+        for (index, (name, snapshot_path, subvolume_id)) in candidates.iter().enumerate() {
+            println!(
+                "Submitting deletion {}/{}: {} (subvolume id {})",
+                index + 1,
+                candidates.len(),
+                snapshot_path.display(),
+                subvolume_id
+            );
+            io::stdout().flush()?;
+            let subvolume_name = CString::new(name.as_str())?;
+            if let Err(error) = subvolume::subvolume_delete(parent_fd.as_fd(), &subvolume_name) {
+                failures += 1;
+                eprintln!(
+                    "Could not delete orphan snapshot {}: {error}",
+                    snapshot_path.display()
+                );
+                continue;
+            }
+            deleted_count += 1;
+            println!(
+                "Deletion submitted for snapshot {}/{}: {}; Btrfs reclaims extents asynchronously.",
+                index + 1,
+                candidates.len(),
+                snapshot_path.display()
+            );
+        }
+    } else {
+        for (_, snapshot_path, subvolume_id) in &candidates {
+            println!(
+                "Orphan snapshot candidate: {} (subvolume id {})",
+                snapshot_path.display(),
+                subvolume_id
+            );
+        }
+    }
+
+    if delete {
+        println!(
+            "Orphan cleanup: submitted={deleted_count}, failed={failures}. Btrfs may continue reclaiming space in the background."
+        );
+    } else {
+        println!(
+            "Orphan cleanup preview: candidates={}, failed={failures}. Rerun with --delete to remove candidates.",
+            candidates.len()
+        );
+    }
+    if failures > 0 {
+        return Err(format!("orphan cleanup encountered {failures} errors").into());
+    }
+    Ok(())
 }
 
 fn load_pending_duplicates(store: &Store, scan_id: &str) -> Result<Vec<Duplicate>> {
@@ -1100,24 +1303,48 @@ async fn run_cli(arguments: Vec<std::ffi::OsString>, db_path: PathBuf) -> Result
         }
         "finish" => {
             let arguments = args.collect::<Vec<_>>();
-            let delete_data = arguments.iter().any(|argument| argument == "--delete");
-            let scan_ids = arguments
-                .into_iter()
-                .filter(|argument| argument != "--delete")
-                .collect::<Vec<_>>();
-            if scan_ids.len() != 1 {
-                return Err("usage: btrfs-dup finish <scan-id> [--delete]".into());
+            let mut delete_data = false;
+            let mut scan_id = None;
+            for argument in arguments {
+                match argument.to_str() {
+                    Some("--delete") if !delete_data => delete_data = true,
+                    Some(value) if value.starts_with("--") => {
+                        return Err(format!("unknown or repeated finish option: {value}").into());
+                    }
+                    Some(value) if scan_id.is_none() => scan_id = Some(value.to_owned()),
+                    _ => return Err("usage: btrfs-dup finish <scan-id> [--delete]".into()),
+                }
             }
-            let id = scan_ids[0].to_string_lossy().into_owned();
+            let id = scan_id.ok_or("usage: btrfs-dup finish <scan-id> [--delete]")?;
             let scan = load_scan(&store, &id)?;
             finish_scan(&store, scan, delete_data)
+        }
+        "cleanup" => {
+            if args.next().as_deref() != Some(std::ffi::OsStr::new("--orphans")) {
+                return Err("usage: btrfs-dup cleanup --orphans <mount-path> [--delete]".into());
+            }
+            let mount_path = PathBuf::from(
+                args.next()
+                    .ok_or("usage: btrfs-dup cleanup --orphans <mount-path> [--delete]")?,
+            );
+            let delete = match args.next() {
+                Some(flag) if flag == "--delete" => true,
+                Some(_) => {
+                    return Err("usage: btrfs-dup cleanup --orphans <mount-path> [--delete]".into());
+                }
+                None => false,
+            };
+            if args.next().is_some() {
+                return Err("usage: btrfs-dup cleanup --orphans <mount-path> [--delete]".into());
+            }
+            cleanup_orphan_snapshots(&store, &mount_path, delete)
         }
         _ => usage(),
     }
 }
 
 fn usage<T>() -> Result<T> {
-    Err("usage: btrfs-dup [--db <path>] [dedup [<mount-path|/dev/device>] [--dry-run] | dedup --resume <scan-id> | list | status <scan-id> | verify <scan-id> | commit <scan-id> | finish <scan-id> [--delete] | resume <scan-id> | gui | install]".into())
+    Err("usage: btrfs-dup [--db <path>] [dedup [<mount-path|/dev/device>] [--dry-run] | dedup --resume <scan-id> | list | status <scan-id> | verify <scan-id> | commit <scan-id> | finish <scan-id> [--delete] | cleanup --orphans <mount-path> [--delete] | resume <scan-id> | gui | install]".into())
 }
 
 fn take_db_path(arguments: &mut Vec<std::ffi::OsString>) -> Result<PathBuf> {
@@ -1140,6 +1367,7 @@ fn take_db_path(arguments: &mut Vec<std::ffi::OsString>) -> Result<PathBuf> {
                     | "verify"
                     | "commit"
                     | "finish"
+                    | "cleanup"
                     | "gui"
                     | "install"
             ) {
@@ -1902,11 +2130,14 @@ async fn hash_candidate_ranges_parallel(
     files: &[HashedFile],
     buckets: &HashMap<(usize, u64), Vec<(PathBuf, u64, Option<Vec<u8>>)>>,
 ) -> Result<HashMap<(PathBuf, u64), Vec<u8>>> {
-    let mut current_counts = HashMap::new();
-    for block in files.iter().flat_map(|file| &file.blocks) {
-        *current_counts
-            .entry((block.len, block.xxh3))
-            .or_insert(0usize) += 1;
+    let mut current_paths: HashMap<(usize, u64), HashSet<PathBuf>> = HashMap::new();
+    for file in files {
+        for block in &file.blocks {
+            current_paths
+                .entry((block.len, block.xxh3))
+                .or_default()
+                .insert(file.path.clone());
+        }
     }
 
     let mut ranges = HashMap::new();
@@ -1914,12 +2145,10 @@ async fn hash_candidate_ranges_parallel(
         for block in &file.blocks {
             let key = (block.len, block.xxh3);
             let members = buckets.get(&key);
-            let has_other_candidate = members.is_some_and(|members| {
-                members
-                    .iter()
-                    .any(|member| member.0 != file.path || member.1 != block.offset)
-            });
-            if !has_other_candidate && current_counts[&key] < 2 {
+            let has_other_candidate = members
+                .is_some_and(|members| members.iter().any(|member| member.0 != file.path))
+                || current_paths[&key].iter().any(|path| path != &file.path);
+            if !has_other_candidate {
                 continue;
             }
 
@@ -2002,7 +2231,7 @@ fn index_hashed_file(
             .iter()
             .find(|m| m.0 == file.path && m.1 == offset)
             .and_then(|m| m.2.clone());
-        let has_other_candidate = members.iter().any(|m| m.0 != file.path || m.1 != offset);
+        let has_other_candidate = members.iter().any(|m| m.0 != file.path);
         let strong = if !has_other_candidate {
             same_block
         } else {
@@ -2067,7 +2296,7 @@ fn index_hashed_file(
 
         if let Some(digest) = strong {
             for (candidate_snapshot, candidate_offset, candidate_digest) in members.iter() {
-                if candidate_snapshot == &file.path && *candidate_offset == offset {
+                if candidate_snapshot == &file.path {
                     continue;
                 }
                 if candidate_digest.as_deref() != Some(digest.as_slice()) {
@@ -2084,13 +2313,12 @@ fn index_hashed_file(
                     ))?;
                 }
             }
-            let duplicate_source =
-                members
-                    .iter()
-                    .find(|(candidate_path, candidate_offset, candidate_digest)| {
-                        !(candidate_path == &file.path && *candidate_offset == offset)
-                            && candidate_digest.as_deref() == Some(digest.as_slice())
-                    });
+            let duplicate_source = members
+                .iter()
+                .find(|(candidate_path, _, candidate_digest)| {
+                    candidate_path != &file.path
+                        && candidate_digest.as_deref() == Some(digest.as_slice())
+                });
             if let Some((candidate_snapshot, candidate_offset, _)) = duplicate_source {
                 progress.duplicates += 1;
                 progress.duplicate_bytes += len as u64;
@@ -2775,6 +3003,55 @@ mod tests {
         let mut arguments = vec!["--db".into(), "finish".into(), "scan-1".into()];
 
         assert!(take_db_path(&mut arguments).is_err());
+    }
+
+    #[test]
+    fn database_option_recognizes_cleanup_as_a_command() {
+        let mut arguments = vec!["--db".into(), "cleanup".into(), "--orphans".into()];
+
+        assert!(take_db_path(&mut arguments).is_err());
+    }
+
+    #[test]
+    fn scan_does_not_create_duplicate_pairs_between_ranges_in_one_file() {
+        let file_path = PathBuf::from("/snapshot/repeated-data.bin");
+        let file = HashedFile {
+            path: file_path.clone(),
+            relative: PathBuf::from("repeated-data.bin"),
+            size: 8192,
+            blocks: vec![HashedBlock {
+                offset: 4096,
+                len: 4096,
+                xxh3: 7,
+            }],
+        };
+        let mut buckets = HashMap::from([((4096, 7), vec![(file_path, 0, None)])]);
+        let mut scan = Scan {
+            scan_id: Some("scan-1".into()),
+            source: "/source".into(),
+            snapshot: "/snapshot".into(),
+            state: "running".into(),
+            dry_run: true,
+            files: 0,
+            blocks: 0,
+        };
+        let mut progress =
+            ScanProgress::new(&Inventory::default(), 0, 0, 0, 0, 0, ProgressMode::Scan);
+        let mut batch = WriteBatch::new();
+
+        index_hashed_file(
+            &mut scan,
+            &file,
+            Path::new("/source/repeated-data.bin"),
+            &mut buckets,
+            &HashMap::new(),
+            &mut progress,
+            &mut batch,
+        )
+        .expect("index a same-file range");
+
+        assert!(batch.duplicates.is_empty());
+        assert_eq!(progress.duplicates, 0);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 A minimal Btrfs snapshot scanner and extent deduplicator. The embedded SQLite
 database defaults to `./btrfs-dup.sqlite`. Use the global `--db <path>` option
 to choose another database file; the path can appear before or after the
-command. Existing LanceDB data is not migrated or read.
+command. 
 
 Build with the pinned Nix toolchain (including `libclang` and the GTK/WebKit
 libraries required by the desktop GUI):
@@ -26,6 +26,8 @@ cargo run -- verify <scan-id>
 cargo run -- commit <scan-id>
 cargo run -- finish <scan-id>
 cargo run -- finish <scan-id> --delete
+cargo run -- cleanup --orphans /mnt/data
+cargo run -- cleanup --orphans /mnt/data --delete
 cargo run -- --db /var/lib/btrfs-dup.sqlite gui
 cargo run -- resume <scan-id>
 cargo run -- dedup --resume <scan-id>
@@ -113,6 +115,13 @@ scan finished. The scan's database records are retained by default, but the
 scan can no longer be resumed. Add `--delete` to also delete all database
 records belonging to that scan; this removes its status, duplicate, and index
 data as well.
+`cleanup --orphans <mount-path>` previews app-named snapshots under that
+mount's `.btrfs-dup-snapshots` directory that have no matching scan records in
+the selected database. It only considers direct, read-only Btrfs snapshots.
+Add `--delete` to submit removal of all listed orphan snapshots to Btrfs. The
+command reports each submitted deletion and exits without waiting for the
+background cleaner; space reclamation continues asynchronously. The mount path
+must be the Btrfs mount root.
 `gui` opens a local Dioxus desktop database browser for the selected `--db`
 store. It paginates scan and per-scan record rows; command actions are shown as
 placeholders in the sidebar.
