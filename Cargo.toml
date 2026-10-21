@@ -13,6 +13,7 @@ btrfs-uapi = "0.13.0"
 lancedb = { version = "0.40.0", features = ["remote"] }
 futures = "0.3"
 libc = "0.2"
+dioxus = { version = "0.7.3", default-features = false, features = ["desktop", "lib", "launch"] }
 
 [profile.release]
 opt-level = 3

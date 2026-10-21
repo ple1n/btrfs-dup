@@ -30,11 +30,16 @@ use lancedb::{
         arrow_array::{RecordBatch, RecordBatchIterator, StringArray, UInt64Array},
         arrow_schema::{DataType, Field, Schema},
     },
-    index::{Index, scalar::BTreeIndexBuilder},
+    index::{
+        Index,
+        scalar::{BTreeIndexBuilder, BitmapIndexBuilder},
+    },
     query::{ExecutableQuery, QueryBase},
 };
 use serde::{Deserialize, Serialize};
 use twox_hash::XxHash3_64;
+
+mod gui;
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
@@ -46,12 +51,15 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BlockDecision {
+    Exclude,
     WholeFile,
     FixedChunks(usize),
 }
 
 fn block_decision_function(file_size: u64) -> BlockDecision {
-    if file_size < 10 * MIB {
+    if file_size < 2 * MIB {
+        BlockDecision::Exclude
+    } else if file_size < 10 * MIB {
         BlockDecision::WholeFile
     } else if file_size < 2 * GIB {
         BlockDecision::FixedChunks(TEN_MIB)
@@ -237,7 +245,15 @@ struct ScanProgress {
     rate_samples: VecDeque<(Instant, u64)>,
     bytes_per_second: f64,
     panel_drawn: bool,
-    verification: bool,
+    mode: ProgressMode,
+    successful_pairs: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProgressMode {
+    Scan,
+    Verify,
+    Commit,
 }
 
 impl ScanProgress {
@@ -248,7 +264,7 @@ impl ScanProgress {
         completed_bytes: u64,
         duplicates: u64,
         duplicate_bytes: u64,
-        verification: bool,
+        mode: ProgressMode,
     ) -> Self {
         let now = Instant::now();
         Self {
@@ -266,7 +282,8 @@ impl ScanProgress {
             rate_samples: VecDeque::from([(now, completed_bytes)]),
             bytes_per_second: 0.0,
             panel_drawn: false,
-            verification,
+            mode,
+            successful_pairs: 0,
         }
     }
 
@@ -297,11 +314,17 @@ impl ScanProgress {
             return Ok(());
         }
         self.last_draw = now;
-        let fraction = if self.verification {
+        let fraction = if self.mode == ProgressMode::Verify {
             if self.total_files == 0 || self.files == self.total_files {
                 1.0
             } else {
                 (self.bytes as f64 / self.total_bytes.max(1) as f64).min(1.0)
+            }
+        } else if self.mode == ProgressMode::Commit {
+            if self.total_files == 0 {
+                1.0
+            } else {
+                (self.files as f64 / self.total_files as f64).min(1.0)
             }
         } else if self.total_bytes == 0 {
             1.0
@@ -315,7 +338,7 @@ impl ScanProgress {
         let remaining_bytes = self.total_bytes.saturating_sub(self.bytes);
         let rate = format_byte_rate(self.bytes_per_second);
         let elapsed = format_duration(now.duration_since(self.started_at));
-        let last_line = if self.verification {
+        let last_line = if self.mode == ProgressMode::Verify {
             format!(
                 "Pairs: {}/{} | Blocks: {}/{} | Verified: {} | Anomalies: {}",
                 self.files,
@@ -323,6 +346,17 @@ impl ScanProgress {
                 self.blocks,
                 self.total_blocks,
                 self.blocks.saturating_sub(self.duplicates),
+                self.duplicates
+            )
+        } else if self.mode == ProgressMode::Commit {
+            format!(
+                "Pairs: {}/{} | Blocks: {}/{} | Deduped: {} ({}) | Anomalies: {}",
+                self.files,
+                self.total_files,
+                self.blocks,
+                self.total_blocks,
+                self.successful_pairs,
+                format_bytes(self.duplicate_bytes),
                 self.duplicates
             )
         } else {
@@ -339,23 +373,31 @@ impl ScanProgress {
         let lines = [
             format!(
                 "{} [{bar}] {percent:3}%",
-                if self.verification { "Verify" } else { "Scan" }
+                match self.mode {
+                    ProgressMode::Scan => "Scan",
+                    ProgressMode::Verify => "Verify",
+                    ProgressMode::Commit => "Commit",
+                }
             ),
             format!(
                 "{}: {} / {} | {} remaining | {} rate {} | elapsed {elapsed}",
-                if self.verification {
-                    "Bytes compared"
-                } else {
-                    "Bytes read"
+                match self.mode {
+                    ProgressMode::Scan => "Bytes read",
+                    ProgressMode::Verify => "Bytes compared",
+                    ProgressMode::Commit => "Bytes processed",
                 },
                 format_bytes(self.bytes),
                 format_bytes(self.total_bytes),
-                if self.verification {
+                if self.mode != ProgressMode::Scan {
                     format!("{} pairs", self.total_files.saturating_sub(self.files))
                 } else {
                     format_bytes(remaining_bytes)
                 },
-                if self.verification { "compare" } else { "read" },
+                match self.mode {
+                    ProgressMode::Scan => "read",
+                    ProgressMode::Verify => "compare",
+                    ProgressMode::Commit => "commit",
+                },
                 rate,
             ),
             last_line,
@@ -661,20 +703,34 @@ async fn ensure_record_indexes(table: &Table) -> Result<()> {
         indexed_columns.insert(column.to_owned());
         eprintln!("B-tree index on {column} is ready.");
     }
+    if !indexed_columns.contains("kind") {
+        eprintln!("Building bitmap index on kind for existing records...");
+        table
+            .create_index(&["kind"], Index::Bitmap(BitmapIndexBuilder::default()))
+            .execute()
+            .await?;
+        eprintln!("Bitmap index on kind is ready.");
+    }
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let mut arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     let db_path = take_db_path(&mut arguments)?;
     let command = arguments.first().cloned().unwrap_or_else(|| "dedup".into());
-    if command == "verify" {
+    if command == "verify" || command == "commit" {
         let scan_id = arguments
             .get(1)
             .map(|id| id.to_string_lossy())
             .unwrap_or_else(|| "<missing scan id>".into());
-        eprintln!("Starting verification for scan {scan_id}; opening database...");
+        eprintln!(
+            "Starting {} for scan {scan_id}; opening database...",
+            if command == "verify" {
+                "verification"
+            } else {
+                "commit"
+            }
+        );
     }
     if command == "install" {
         if arguments.len() > 1 {
@@ -682,9 +738,23 @@ async fn main() -> Result<()> {
         }
         return install();
     }
+    if command == "gui" {
+        if arguments.len() > 1 {
+            return Err("usage: btrfs-dup [--db <path>] gui".into());
+        }
+        return gui::launch(db_path);
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(run_cli(arguments, db_path))
+}
+
+async fn run_cli(arguments: Vec<std::ffi::OsString>, db_path: PathBuf) -> Result<()> {
+    let command = arguments.first().cloned().unwrap_or_else(|| "dedup".into());
     let mut args = arguments.into_iter().skip(1);
     let table = open_store(&db_path).await?;
-    if command == "verify" {
+    if command == "verify" || command == "commit" {
         eprintln!("Database opened; loading scan records...");
     }
     match command.to_string_lossy().as_ref() {
@@ -818,6 +888,7 @@ async fn main() -> Result<()> {
                 return Err("usage: btrfs-dup verify <scan-id>".into());
             }
             let scan = load_scan(&table, &id).await?;
+            eprintln!("Loading duplicate relationships for scan {id}...");
             let duplicates = load_records(&table, "duplicate", Some(&id))
                 .await?
                 .iter()
@@ -825,12 +896,30 @@ async fn main() -> Result<()> {
                 .collect::<Result<Vec<_>>>()?;
             verify_duplicates(&scan, &duplicates)
         }
+        "commit" => {
+            let id = args
+                .next()
+                .ok_or("usage: btrfs-dup commit <scan-id>")?
+                .to_string_lossy()
+                .into_owned();
+            if args.next().is_some() {
+                return Err("usage: btrfs-dup commit <scan-id>".into());
+            }
+            let scan = load_scan(&table, &id).await?;
+            eprintln!("Loading duplicate relationships for scan {id}...");
+            let duplicates = load_records(&table, "duplicate", Some(&id))
+                .await?
+                .iter()
+                .map(decode_record::<Duplicate>)
+                .collect::<Result<Vec<_>>>()?;
+            commit_duplicates(&table, &scan, &duplicates).await
+        }
         _ => usage(),
     }
 }
 
 fn usage<T>() -> Result<T> {
-    Err("usage: btrfs-dup [--db <path>] [dedup [<mount-path|/dev/device>] [--dry-run] | dedup --resume <scan-id> | list | status <scan-id> | verify <scan-id> | resume <scan-id> | install]".into())
+    Err("usage: btrfs-dup [--db <path>] [dedup [<mount-path|/dev/device>] [--dry-run] | dedup --resume <scan-id> | list | status <scan-id> | verify <scan-id> | commit <scan-id> | resume <scan-id> | install]".into())
 }
 
 fn take_db_path(arguments: &mut Vec<std::ffi::OsString>) -> Result<PathBuf> {
@@ -846,7 +935,7 @@ fn take_db_path(arguments: &mut Vec<std::ffi::OsString>) -> Result<PathBuf> {
             }
             if matches!(
                 arguments[index + 1].to_string_lossy().as_ref(),
-                "dedup" | "list" | "resume" | "status" | "verify" | "install"
+                "dedup" | "list" | "resume" | "status" | "verify" | "commit" | "gui" | "install"
             ) {
                 return Err(
                     "--db is missing its path; use 'btrfs-dup list' for the default database, or 'btrfs-dup --db <path> list'".into(),
@@ -926,10 +1015,10 @@ fn install() -> Result<()> {
 }
 
 const FISH_COMPLETION: &str = r#"
-complete -c btrfs-dup -f -n '__fish_use_subcommand' -a 'dedup list status verify resume install'
+complete -c btrfs-dup -f -n '__fish_use_subcommand' -a 'dedup list status verify commit resume gui install'
 complete -c btrfs-dup -n '__fish_seen_subcommand_from dedup' -l dry-run -d 'Index without deduplicating file contents'
 complete -c btrfs-dup -n '__fish_seen_subcommand_from dedup' -l resume -d 'Resume a scan by ID'
-complete -c btrfs-dup -n '__fish_seen_subcommand_from resume status verify' -a '(btrfs-dup list 2>/dev/null | cut -f1)'
+complete -c btrfs-dup -n '__fish_seen_subcommand_from resume status verify commit' -a '(btrfs-dup list 2>/dev/null | cut -f1)'
 "#;
 
 const BASH_COMPLETION: &str = r#"
@@ -938,7 +1027,7 @@ _btrfs_dup_completion() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     if (( COMP_CWORD == 1 )); then
-        COMPREPLY=( $(compgen -W "dedup list status verify resume install" -- "$cur") )
+        COMPREPLY=( $(compgen -W "dedup list status verify commit resume gui install" -- "$cur") )
         return
     fi
     case "$prev" in
@@ -948,7 +1037,7 @@ _btrfs_dup_completion() {
                 COMPREPLY+=( $(compgen -f -- "$cur") )
             fi
             ;;
-        resume|status|verify|--resume)
+        resume|status|verify|commit|--resume)
             COMPREPLY=( $(btrfs-dup list 2>/dev/null | cut -f1 | while read -r id; do [[ "$id" == "$cur"* ]] && printf '%s\n' "$id"; done) )
             ;;
     esac
@@ -966,7 +1055,9 @@ _btrfs_dup() {
         'list:List scans'
         'status:Show scan status'
         'verify:Verify recorded duplicate contents'
+        'commit:Commit a saved scan to its source filesystem'
         'resume:Resume a scan'
+        'gui:Browse saved database records'
         'install:Install binary and shell completion'
     )
     if (( CURRENT == 2 )); then
@@ -980,7 +1071,7 @@ _btrfs_dup() {
                 '--resume[Resume a scan]:scan ID:' \
                 '*:mounted path or device:_files'
             ;;
-        resume|status|verify)
+        resume|status|verify|commit)
             _arguments '*:scan ID:($(btrfs-dup list 2>/dev/null | cut -f1))'
             ;;
     esac
@@ -1171,15 +1262,15 @@ async fn run_scan(table: &Table, mut scan: Scan) -> Result<()> {
     let mut buckets: HashMap<(usize, u64), Vec<(PathBuf, u64, Option<Vec<u8>>)>> = HashMap::new();
     // Rebuild the in-memory candidate map from persisted block rows on resume;
     // this also makes repeated indexing safe through deterministic record IDs.
-    let prior = load_records(table, "block", Some(scan.key()))
-        .await?
+    let prior_records = load_records(table, "block", Some(scan.key())).await?;
+    let prior = prior_records
         .iter()
         .map(decode_record::<Block>)
         .collect::<Result<Vec<_>>>()?;
     let mut batch = WriteBatch::new();
     scan.blocks = prior.len() as u64;
-    let prior_files = load_records(table, "file", Some(scan.key()))
-        .await?
+    let prior_file_records = load_records(table, "file", Some(scan.key())).await?;
+    let prior_files = prior_file_records
         .iter()
         .map(decode_record::<ScannedFile>)
         .collect::<Result<Vec<_>>>()?;
@@ -1238,7 +1329,7 @@ async fn run_scan(table: &Table, mut scan: Scan) -> Result<()> {
         completed_bytes,
         duplicate_count,
         duplicate_bytes,
-        false,
+        ProgressMode::Scan,
     );
     println!(
         "Resuming: skipping {} completed files ({}).",
@@ -1296,9 +1387,13 @@ fn inventory_directory(
         if metadata.is_dir() {
             inventory_directory(root, &path, source_root, source_mount_id, inventory)?;
         } else if metadata.is_file() {
+            let size = metadata.len();
+            if block_decision_function(size) == BlockDecision::Exclude {
+                continue;
+            }
             inventory.files += 1;
-            inventory.bytes += metadata.len();
-            inventory.blocks += blocks_for_size(metadata.len());
+            inventory.bytes += size;
+            inventory.blocks += blocks_for_size(size);
             inventory.paths.push((path.clone(), relative.to_path_buf()));
             if io::stderr().is_terminal()
                 && inventory
@@ -1352,6 +1447,7 @@ fn blocks_for_size(size: u64) -> u64 {
         return 0;
     }
     match block_decision_function(size) {
+        BlockDecision::Exclude => 0,
         BlockDecision::WholeFile => 1,
         BlockDecision::FixedChunks(chunk_size) => size.div_ceil(chunk_size as u64),
     }
@@ -1451,24 +1547,27 @@ async fn persist_hashed_blocks(
         .iter()
         .flat_map(|file| {
             let path = path_bytes(&file.relative);
-            file.blocks.iter().map(move |block| {
-                let id = block_id(scan_id, &path, block.offset);
-                stored_record(
-                    &id,
-                    "block",
-                    scan_id,
-                    block.len as u64,
-                    &block.xxh3.to_be_bytes(),
-                    &Block {
-                        scan: scan_id.to_owned(),
-                        xxh3: block.xxh3,
-                        len: block.len,
-                        path: path.clone(),
-                        offset: block.offset,
-                        blake3: None,
-                    },
-                )
-            })
+            file.blocks
+                .iter()
+                .filter(|block| block.len > 0)
+                .map(move |block| {
+                    let id = block_id(scan_id, &path, block.offset);
+                    stored_record(
+                        &id,
+                        "block",
+                        scan_id,
+                        block.len as u64,
+                        &block.xxh3.to_be_bytes(),
+                        &Block {
+                            scan: scan_id.to_owned(),
+                            xxh3: block.xxh3,
+                            len: block.len,
+                            path: path.clone(),
+                            offset: block.offset,
+                            blake3: None,
+                        },
+                    )
+                })
         })
         .collect::<Result<Vec<_>>>()
         .map_err(|error| error.to_string())?;
@@ -1485,6 +1584,12 @@ fn hash_file(
     let mut file = File::open(&path)?;
     let size = file.metadata()?.len();
     let chunk_size = match block_decision_function(size) {
+        BlockDecision::Exclude => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("file is below the 2 MiB scan minimum: {}", path.display()),
+            ));
+        }
         BlockDecision::WholeFile => usize::try_from(size).unwrap_or(usize::MAX).max(1),
         BlockDecision::FixedChunks(size) => size,
     };
@@ -1532,6 +1637,9 @@ fn index_hashed_file(
     for hashed_block in &file.blocks {
         let offset = hashed_block.offset;
         let len = hashed_block.len;
+        if len == 0 {
+            continue;
+        }
         let xxh3 = hashed_block.xxh3;
         let key = (len, xxh3);
         let members = buckets.entry(key).or_default();
@@ -1630,7 +1738,16 @@ fn index_hashed_file(
                 let deduped_bytes = if scan.dry_run {
                     0
                 } else {
-                    dedupe_live_ranges(writable, offset, &candidate_live, *candidate_offset, len)?
+                    match dedupe_live_ranges(
+                        writable,
+                        offset,
+                        &candidate_live,
+                        *candidate_offset,
+                        len,
+                    )? {
+                        DedupeOutcome::Deduped(bytes) => bytes,
+                        DedupeOutcome::DataDiffers | DedupeOutcome::Skipped => 0,
+                    }
                 };
                 let duplicate_path = path_bytes(&file.relative);
                 let duplicate_id = duplicate_id(scan.key(), &duplicate_path, offset);
@@ -1698,15 +1815,22 @@ fn source_label(source: &Path) -> String {
         .into_owned()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DedupeOutcome {
+    Deduped(u64),
+    DataDiffers,
+    Skipped,
+}
+
 fn dedupe_live_ranges(
     source_path: &Path,
     source_offset: u64,
     dest_path: &Path,
     dest_offset: u64,
     len: usize,
-) -> Result<u64> {
+) -> Result<DedupeOutcome> {
     if len % 4096 != 0 || source_path == dest_path && source_offset == dest_offset {
-        return Ok(0);
+        return Ok(DedupeOutcome::Skipped);
     }
     let source = File::open(source_path)?;
     let dest = File::options().read(true).write(true).open(dest_path)?;
@@ -1718,8 +1842,8 @@ fn dedupe_live_ranges(
     }];
     let results = file_extent_same(source.as_fd(), source_offset, len as u64, &targets)?;
     match results[0] {
-        DedupeResult::Deduped(bytes) => Ok(bytes),
-        DedupeResult::DataDiffers => Ok(0),
+        DedupeResult::Deduped(bytes) => Ok(DedupeOutcome::Deduped(bytes)),
+        DedupeResult::DataDiffers => Ok(DedupeOutcome::DataDiffers),
         DedupeResult::Error(code) => Err(format!("Btrfs dedupe target error: {code}").into()),
     }
 }
@@ -1735,7 +1859,7 @@ fn verify_duplicates(scan: &Scan, duplicates: &[Duplicate]) -> Result<()> {
         bytes: total_bytes,
         ..Inventory::default()
     };
-    let mut progress = ScanProgress::new(&inventory, 0, 0, 0, 0, 0, true);
+    let mut progress = ScanProgress::new(&inventory, 0, 0, 0, 0, 0, ProgressMode::Verify);
     progress.draw(true)?;
     let mut verified = 0u64;
     let mut mismatches = 0u64;
@@ -1761,7 +1885,7 @@ fn verify_duplicates(scan: &Scan, duplicates: &[Duplicate]) -> Result<()> {
                 duplicate.source_offset,
                 duplicate.len
             ))?;
-            update_verification_progress(&mut progress)?;
+            update_pair_progress(&mut progress)?;
             continue;
         }
         let len = match usize::try_from(duplicate.len) {
@@ -1773,7 +1897,7 @@ fn verify_duplicates(scan: &Scan, duplicates: &[Duplicate]) -> Result<()> {
                     "ANOMALY invalid duplicate length {}: {error}",
                     duplicate.len
                 ))?;
-                update_verification_progress(&mut progress)?;
+                update_pair_progress(&mut progress)?;
                 continue;
             }
         };
@@ -1823,7 +1947,7 @@ fn verify_duplicates(scan: &Scan, duplicates: &[Duplicate]) -> Result<()> {
                 ))?;
             }
         }
-        update_verification_progress(&mut progress)?;
+        update_pair_progress(&mut progress)?;
     }
     progress.draw(true)?;
     let compared_bytes = progress.bytes;
@@ -1843,7 +1967,200 @@ fn verify_duplicates(scan: &Scan, duplicates: &[Duplicate]) -> Result<()> {
     Ok(())
 }
 
-fn update_verification_progress(progress: &mut ScanProgress) -> Result<()> {
+async fn commit_duplicates(table: &Table, scan: &Scan, duplicates: &[Duplicate]) -> Result<()> {
+    if scan.state != "complete" {
+        return Err(format!(
+            "cannot commit scan {} while its state is {:?}; only completed scans can be committed",
+            scan.key(),
+            scan.state
+        )
+        .into());
+    }
+
+    let root = PathBuf::from(&scan.source);
+    let mounted_root = resolve_btrfs_mount(&root)?;
+    let canonical_root = fs::canonicalize(&root)?;
+    if mounted_root != canonical_root {
+        return Err(format!(
+            "saved scan source {} is not the root of its mounted Btrfs filesystem {}",
+            canonical_root.display(),
+            mounted_root.display()
+        )
+        .into());
+    }
+
+    let total_bytes = duplicates
+        .iter()
+        .fold(0u64, |total, duplicate| total.saturating_add(duplicate.len));
+    let inventory = Inventory {
+        files: duplicates.len() as u64,
+        blocks: duplicates.len() as u64,
+        bytes: total_bytes,
+        ..Inventory::default()
+    };
+    let mut progress = ScanProgress::new(&inventory, 0, 0, 0, 0, 0, ProgressMode::Commit);
+    progress.draw(true)?;
+    let mut committed_pairs = 0u64;
+    let mut committed_bytes = 0u64;
+    let mut mismatches = 0u64;
+    let mut errors = 0u64;
+    let mut pending_records = Vec::with_capacity(512);
+
+    for mut duplicate in duplicates.iter().cloned() {
+        let duplicate_path = PathBuf::from(std::ffi::OsString::from_vec(
+            duplicate.duplicate_path.clone(),
+        ));
+        let source_path =
+            PathBuf::from(std::ffi::OsString::from_vec(duplicate.source_path.clone()));
+        if duplicate.scan != scan.key()
+            || duplicate.len == 0
+            || !safe_relative_path(&duplicate_path)
+            || !safe_relative_path(&source_path)
+        {
+            errors += 1;
+            progress.duplicates += 1;
+            progress.log(format!(
+                "ANOMALY invalid stored duplicate relation: {} @ {} vs {} @ {} ({} bytes)",
+                duplicate_path.display(),
+                duplicate.duplicate_offset,
+                source_path.display(),
+                duplicate.source_offset,
+                duplicate.len
+            ))?;
+            update_pair_progress(&mut progress)?;
+            continue;
+        }
+        let len = match usize::try_from(duplicate.len) {
+            Ok(len) => len,
+            Err(error) => {
+                errors += 1;
+                progress.duplicates += 1;
+                progress.log(format!(
+                    "ANOMALY invalid duplicate length {}: {error}",
+                    duplicate.len
+                ))?;
+                update_pair_progress(&mut progress)?;
+                continue;
+            }
+        };
+        let duplicate_absolute = root.join(&duplicate_path);
+        let source_absolute = root.join(&source_path);
+        match dedupe_live_ranges(
+            &duplicate_absolute,
+            duplicate.duplicate_offset,
+            &source_absolute,
+            duplicate.source_offset,
+            len,
+        ) {
+            Ok(DedupeOutcome::Deduped(bytes)) => {
+                duplicate.deduped_bytes = bytes;
+                committed_pairs += 1;
+                committed_bytes = committed_bytes.saturating_add(bytes);
+                progress.successful_pairs += 1;
+                progress.duplicate_bytes = progress.duplicate_bytes.saturating_add(bytes);
+                pending_records.push(stored_record(
+                    &duplicate_id(
+                        scan.key(),
+                        &duplicate.duplicate_path,
+                        duplicate.duplicate_offset,
+                    ),
+                    "duplicate",
+                    scan.key(),
+                    0,
+                    &[],
+                    &duplicate,
+                )?);
+            }
+            Ok(DedupeOutcome::DataDiffers) => {
+                mismatches += 1;
+                progress.duplicates += 1;
+                duplicate.deduped_bytes = 0;
+                progress.log(format!(
+                    "ANOMALY contents differ; not deduped: {} @ {} vs {} @ {} ({} bytes)",
+                    duplicate_path.display(),
+                    duplicate.duplicate_offset,
+                    source_path.display(),
+                    duplicate.source_offset,
+                    duplicate.len
+                ))?;
+                pending_records.push(stored_record(
+                    &duplicate_id(
+                        scan.key(),
+                        &duplicate.duplicate_path,
+                        duplicate.duplicate_offset,
+                    ),
+                    "duplicate",
+                    scan.key(),
+                    0,
+                    &[],
+                    &duplicate,
+                )?);
+            }
+            Ok(DedupeOutcome::Skipped) => {
+                errors += 1;
+                progress.duplicates += 1;
+                duplicate.deduped_bytes = 0;
+                progress.log(format!(
+                    "ANOMALY skipped unsupported range: {} @ {} vs {} @ {} ({} bytes; ranges must be sector-aligned and distinct)",
+                    duplicate_path.display(),
+                    duplicate.duplicate_offset,
+                    source_path.display(),
+                    duplicate.source_offset,
+                    duplicate.len
+                ))?;
+                pending_records.push(stored_record(
+                    &duplicate_id(
+                        scan.key(),
+                        &duplicate.duplicate_path,
+                        duplicate.duplicate_offset,
+                    ),
+                    "duplicate",
+                    scan.key(),
+                    0,
+                    &[],
+                    &duplicate,
+                )?);
+            }
+            Err(error) => {
+                errors += 1;
+                progress.duplicates += 1;
+                progress.log(format!(
+                    "ANOMALY could not commit {} @ {} vs {} @ {} ({} bytes): {error}",
+                    duplicate_path.display(),
+                    duplicate.duplicate_offset,
+                    source_path.display(),
+                    duplicate.source_offset,
+                    duplicate.len
+                ))?;
+            }
+        }
+        progress.bytes = progress.bytes.saturating_add(duplicate.len);
+        update_pair_progress(&mut progress)?;
+        if pending_records.len() >= 512 {
+            write_records(table, std::mem::take(&mut pending_records)).await?;
+        }
+    }
+    if !pending_records.is_empty() {
+        write_records(table, pending_records).await?;
+    }
+    progress.draw(true)?;
+    println!(
+        "Commit for scan {}: deduped_pairs={}, deduped={}, mismatches={}, errors={}",
+        scan.key(),
+        committed_pairs,
+        format_bytes(committed_bytes),
+        mismatches,
+        errors
+    );
+    if mismatches > 0 || errors > 0 {
+        return Err(
+            format!("commit completed with {mismatches} mismatches and {errors} errors").into(),
+        );
+    }
+    Ok(())
+}
+
+fn update_pair_progress(progress: &mut ScanProgress) -> Result<()> {
     progress.files += 1;
     progress.blocks += 1;
     progress.draw(false)
@@ -2079,7 +2396,10 @@ mod tests {
 
     #[test]
     fn block_decision_function_uses_requested_tiers() {
-        assert_eq!(block_decision_function(0), BlockDecision::WholeFile);
+        assert_eq!(blocks_for_size(0), 0);
+        assert_eq!(block_decision_function(0), BlockDecision::Exclude);
+        assert_eq!(block_decision_function(2 * MIB - 1), BlockDecision::Exclude);
+        assert_eq!(block_decision_function(2 * MIB), BlockDecision::WholeFile);
         assert_eq!(
             block_decision_function(10 * MIB - 1),
             BlockDecision::WholeFile

@@ -5,7 +5,8 @@ store defaults to `./btrfs-dup.lance`. Use the global `--db <path>` option to
 choose another store; the path can appear before or after the command. Existing
 SurrealDB data is not migrated or read.
 
-Build with the pinned Nix toolchain (including `protoc` and `libclang`):
+Build with the pinned Nix toolchain (including `protoc`, `libclang`, and the
+GTK/WebKit libraries required by the desktop GUI):
 
 ```sh
 nix develop --command cargo build --release
@@ -22,6 +23,8 @@ cargo run -- --db /var/lib/btrfs-dup.lance dedup /mnt/data
 cargo run -- list --db /var/lib/btrfs-dup.lance
 cargo run -- status <scan-id>
 cargo run -- verify <scan-id>
+cargo run -- commit <scan-id>
+cargo run -- --db /var/lib/btrfs-dup.lance gui
 cargo run -- resume <scan-id>
 cargo run -- dedup --resume <scan-id>
 sudo ./target/release/btrfs-dup install
@@ -53,9 +56,9 @@ that scalar with a B-tree. The original `len` and XXH3 values remain stored
 separately and are checked as the exact tuple; the derived key is not treated
 as a unique identifier.
 The table also maintains B-tree indexes on `scan` and `id` for scan-scoped
-lookups and stable record upserts. When opening an existing database, the CLI
-creates any missing indexes over its existing rows; it does not discard or
-rewrite saved records.
+lookups and stable record upserts, plus a bitmap index on low-cardinality
+`kind` values. When opening an existing database, the CLI creates any missing
+indexes over its existing rows; it does not discard or rewrite saved records.
 
 `--dry-run` still creates the snapshot and persists scan progress/index data,
 but does not call the deduplication ioctl. The snapshot is retained so scans
@@ -91,6 +94,14 @@ persisted duplicate count and matching-byte total.
 and compares their bytes in bounded-memory chunks. It displays scan-style
 progress, logs mismatches or read errors as anomalies, and exits unsuccessfully
 if any pair differs or cannot be read.
+`commit <scan-id>` replays a completed scan's recorded duplicate pairs against
+its saved source mount using Btrfs extent deduplication. Btrfs checks each range
+before sharing extents; mismatches and other anomalies are logged, and successful
+dedupe byte counts are written back to the scan records in batches. Existing
+records are retained.
+`gui` opens a local Dioxus desktop database browser for the selected `--db`
+store. It paginates scan and per-scan record rows; command actions are shown as
+placeholders in the sidebar.
 
 Final chunks are indexed, but dedupe is skipped when their length is not
 sector-aligned. Snapshot creation and dedupe require a Btrfs filesystem and

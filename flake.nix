@@ -40,11 +40,24 @@
               pkgs.protobuf
               pkgs.llvmPackages.clang
               pkgs.llvmPackages.libclang
+              pkgs.pkg-config
+            ];
+            buildInputs = [
+              pkgs.gtk3
+              pkgs.libsoup_3
+              pkgs.openssl
+              pkgs.xdotool
+              pkgs.webkitgtk_4_1
             ];
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
               pkgs.llvmPackages.libclang.lib
               pkgs.llvmPackages.libllvm
+              pkgs.gtk3
+              pkgs.libsoup_3
+              pkgs.openssl
+              pkgs.xdotool
+              pkgs.webkitgtk_4_1
             ];
           };
         });
@@ -58,14 +71,23 @@
             packages = [
               rust
               pkgs.protobuf
+              pkgs.pkg-config
               pkgs.llvmPackages.clang
               pkgs.llvmPackages.libclang
               pkgs.llvmPackages.libllvm
+              pkgs.gtk3
+              pkgs.libsoup_3
+              pkgs.openssl
+              pkgs.xdotool
+              pkgs.webkitgtk_4_1
             ];
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
               pkgs.llvmPackages.libclang.lib
               pkgs.llvmPackages.libllvm
+              pkgs.gtk3
+              pkgs.libsoup_3
+              pkgs.webkitgtk_4_1
             ];
           };
         });
