@@ -21,6 +21,7 @@ cargo run -- dedup /dev/nvme0n1p2
 cargo run -- --db /var/lib/btrfs-dup.lance dedup /mnt/data
 cargo run -- list --db /var/lib/btrfs-dup.lance
 cargo run -- status <scan-id>
+cargo run -- verify <scan-id>
 cargo run -- resume <scan-id>
 cargo run -- dedup --resume <scan-id>
 sudo ./target/release/btrfs-dup install
@@ -51,6 +52,10 @@ store a `UInt64` `hash_key` made by hashing the `(len, xxh3)` tuple and index
 that scalar with a B-tree. The original `len` and XXH3 values remain stored
 separately and are checked as the exact tuple; the derived key is not treated
 as a unique identifier.
+The table also maintains B-tree indexes on `scan` and `id` for scan-scoped
+lookups and stable record upserts. When opening an existing database, the CLI
+creates any missing indexes over its existing rows; it does not discard or
+rewrite saved records.
 
 `--dry-run` still creates the snapshot and persists scan progress/index data,
 but does not call the deduplication ioctl. The snapshot is retained so scans
@@ -82,6 +87,10 @@ Confirmed duplicate block relationships are stored per scan, including both
 relative paths and offsets, candidate length, whether the scan was a dry run,
 and bytes actually reported deduplicated by Btrfs. Resume restores the
 persisted duplicate count and matching-byte total.
+`verify <scan-id>` rereads each recorded pair from the scan's source filesystem
+and compares their bytes in bounded-memory chunks. It displays scan-style
+progress, logs mismatches or read errors as anomalies, and exits unsuccessfully
+if any pair differs or cannot be read.
 
 Final chunks are indexed, but dedupe is skipped when their length is not
 sector-aligned. Snapshot creation and dedupe require a Btrfs filesystem and

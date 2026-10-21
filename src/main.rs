@@ -237,6 +237,7 @@ struct ScanProgress {
     rate_samples: VecDeque<(Instant, u64)>,
     bytes_per_second: f64,
     panel_drawn: bool,
+    verification: bool,
 }
 
 impl ScanProgress {
@@ -247,6 +248,7 @@ impl ScanProgress {
         completed_bytes: u64,
         duplicates: u64,
         duplicate_bytes: u64,
+        verification: bool,
     ) -> Self {
         let now = Instant::now();
         Self {
@@ -264,11 +266,13 @@ impl ScanProgress {
             rate_samples: VecDeque::from([(now, completed_bytes)]),
             bytes_per_second: 0.0,
             panel_drawn: false,
+            verification,
         }
     }
 
     fn draw(&mut self, force: bool) -> Result<()> {
         let now = Instant::now();
+        let since_last_draw = now.duration_since(self.last_draw);
         let sample_elapsed = now.duration_since(self.last_rate_sample_at).as_secs_f64();
         if sample_elapsed >= 0.5 {
             self.last_rate_sample_at = now;
@@ -293,7 +297,13 @@ impl ScanProgress {
             return Ok(());
         }
         self.last_draw = now;
-        let fraction = if self.total_bytes == 0 {
+        let fraction = if self.verification {
+            if self.total_files == 0 || self.files == self.total_files {
+                1.0
+            } else {
+                (self.bytes as f64 / self.total_bytes.max(1) as f64).min(1.0)
+            }
+        } else if self.total_bytes == 0 {
             1.0
         } else {
             (self.bytes as f64 / self.total_bytes as f64).min(1.0)
@@ -305,15 +315,17 @@ impl ScanProgress {
         let remaining_bytes = self.total_bytes.saturating_sub(self.bytes);
         let rate = format_byte_rate(self.bytes_per_second);
         let elapsed = format_duration(now.duration_since(self.started_at));
-        let lines = [
-            format!("Scan [{bar}] {percent:3}%"),
+        let last_line = if self.verification {
             format!(
-                "Bytes read: {} / {} | {} remaining | read rate {} | elapsed {elapsed}",
-                format_bytes(self.bytes),
-                format_bytes(self.total_bytes),
-                format_bytes(remaining_bytes),
-                rate,
-            ),
+                "Pairs: {}/{} | Blocks: {}/{} | Verified: {} | Anomalies: {}",
+                self.files,
+                self.total_files,
+                self.blocks,
+                self.total_blocks,
+                self.blocks.saturating_sub(self.duplicates),
+                self.duplicates
+            )
+        } else {
             format!(
                 "Files: {}/{} | Blocks: {}/{} | Found dups: {} ({})",
                 self.files,
@@ -322,7 +334,31 @@ impl ScanProgress {
                 self.total_blocks,
                 self.duplicates,
                 format_bytes(self.duplicate_bytes)
+            )
+        };
+        let lines = [
+            format!(
+                "{} [{bar}] {percent:3}%",
+                if self.verification { "Verify" } else { "Scan" }
             ),
+            format!(
+                "{}: {} / {} | {} remaining | {} rate {} | elapsed {elapsed}",
+                if self.verification {
+                    "Bytes compared"
+                } else {
+                    "Bytes read"
+                },
+                format_bytes(self.bytes),
+                format_bytes(self.total_bytes),
+                if self.verification {
+                    format!("{} pairs", self.total_files.saturating_sub(self.files))
+                } else {
+                    format_bytes(remaining_bytes)
+                },
+                if self.verification { "compare" } else { "read" },
+                rate,
+            ),
+            last_line,
         ];
         if io::stderr().is_terminal() {
             if self.panel_drawn {
@@ -338,7 +374,7 @@ impl ScanProgress {
                 eprintln!();
                 self.panel_drawn = false;
             }
-        } else if force || self.last_draw.elapsed() >= Duration::from_secs(5) {
+        } else if force || since_last_draw >= Duration::from_secs(5) {
             eprintln!("{}", lines.join("\n"));
         }
         Ok(())
@@ -594,18 +630,38 @@ async fn write_scan(table: &Table, scan: &Scan) -> Result<()> {
 async fn open_store(path: &Path) -> Result<Table> {
     let connection = lancedb::connect(&path.to_string_lossy()).execute().await?;
     let names = connection.table_names().execute().await?;
-    if names.iter().any(|name| name == "records") {
-        return Ok(connection.open_table("records").execute().await?);
-    }
-    let table = connection
-        .create_empty_table("records", record_schema())
-        .execute()
-        .await?;
-    table
-        .create_index(&["hash_key"], Index::BTree(BTreeIndexBuilder::default()))
-        .execute()
-        .await?;
+    let table = if names.iter().any(|name| name == "records") {
+        connection.open_table("records").execute().await?
+    } else {
+        connection
+            .create_empty_table("records", record_schema())
+            .execute()
+            .await?
+    };
+    ensure_record_indexes(&table).await?;
     Ok(table)
+}
+
+async fn ensure_record_indexes(table: &Table) -> Result<()> {
+    let mut indexed_columns = table
+        .list_indices()
+        .await?
+        .into_iter()
+        .flat_map(|index| index.columns)
+        .collect::<HashSet<_>>();
+    for column in ["scan", "id", "hash_key"] {
+        if indexed_columns.contains(column) {
+            continue;
+        }
+        eprintln!("Building B-tree index on {column} for existing records...");
+        table
+            .create_index(&[column], Index::BTree(BTreeIndexBuilder::default()))
+            .execute()
+            .await?;
+        indexed_columns.insert(column.to_owned());
+        eprintln!("B-tree index on {column} is ready.");
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -613,6 +669,13 @@ async fn main() -> Result<()> {
     let mut arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     let db_path = take_db_path(&mut arguments)?;
     let command = arguments.first().cloned().unwrap_or_else(|| "dedup".into());
+    if command == "verify" {
+        let scan_id = arguments
+            .get(1)
+            .map(|id| id.to_string_lossy())
+            .unwrap_or_else(|| "<missing scan id>".into());
+        eprintln!("Starting verification for scan {scan_id}; opening database...");
+    }
     if command == "install" {
         if arguments.len() > 1 {
             return Err("usage: btrfs-dup install".into());
@@ -621,6 +684,9 @@ async fn main() -> Result<()> {
     }
     let mut args = arguments.into_iter().skip(1);
     let table = open_store(&db_path).await?;
+    if command == "verify" {
+        eprintln!("Database opened; loading scan records...");
+    }
     match command.to_string_lossy().as_ref() {
         "dedup" => {
             let remaining = args.collect::<Vec<_>>();
@@ -742,12 +808,29 @@ async fn main() -> Result<()> {
             println!("{s:#?}");
             Ok(())
         }
+        "verify" => {
+            let id = args
+                .next()
+                .ok_or("usage: btrfs-dup verify <scan-id>")?
+                .to_string_lossy()
+                .into_owned();
+            if args.next().is_some() {
+                return Err("usage: btrfs-dup verify <scan-id>".into());
+            }
+            let scan = load_scan(&table, &id).await?;
+            let duplicates = load_records(&table, "duplicate", Some(&id))
+                .await?
+                .iter()
+                .map(decode_record::<Duplicate>)
+                .collect::<Result<Vec<_>>>()?;
+            verify_duplicates(&scan, &duplicates)
+        }
         _ => usage(),
     }
 }
 
 fn usage<T>() -> Result<T> {
-    Err("usage: btrfs-dup [--db <path>] [dedup [<mount-path|/dev/device>] [--dry-run] | dedup --resume <scan-id> | list | status <scan-id> | resume <scan-id> | install]".into())
+    Err("usage: btrfs-dup [--db <path>] [dedup [<mount-path|/dev/device>] [--dry-run] | dedup --resume <scan-id> | list | status <scan-id> | verify <scan-id> | resume <scan-id> | install]".into())
 }
 
 fn take_db_path(arguments: &mut Vec<std::ffi::OsString>) -> Result<PathBuf> {
@@ -763,7 +846,7 @@ fn take_db_path(arguments: &mut Vec<std::ffi::OsString>) -> Result<PathBuf> {
             }
             if matches!(
                 arguments[index + 1].to_string_lossy().as_ref(),
-                "dedup" | "list" | "resume" | "status" | "install"
+                "dedup" | "list" | "resume" | "status" | "verify" | "install"
             ) {
                 return Err(
                     "--db is missing its path; use 'btrfs-dup list' for the default database, or 'btrfs-dup --db <path> list'".into(),
@@ -843,10 +926,10 @@ fn install() -> Result<()> {
 }
 
 const FISH_COMPLETION: &str = r#"
-complete -c btrfs-dup -f -n '__fish_use_subcommand' -a 'dedup list status resume install'
+complete -c btrfs-dup -f -n '__fish_use_subcommand' -a 'dedup list status verify resume install'
 complete -c btrfs-dup -n '__fish_seen_subcommand_from dedup' -l dry-run -d 'Index without deduplicating file contents'
 complete -c btrfs-dup -n '__fish_seen_subcommand_from dedup' -l resume -d 'Resume a scan by ID'
-complete -c btrfs-dup -n '__fish_seen_subcommand_from resume status' -a '(btrfs-dup list 2>/dev/null | cut -f1)'
+complete -c btrfs-dup -n '__fish_seen_subcommand_from resume status verify' -a '(btrfs-dup list 2>/dev/null | cut -f1)'
 "#;
 
 const BASH_COMPLETION: &str = r#"
@@ -855,7 +938,7 @@ _btrfs_dup_completion() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     if (( COMP_CWORD == 1 )); then
-        COMPREPLY=( $(compgen -W "dedup list status resume install" -- "$cur") )
+        COMPREPLY=( $(compgen -W "dedup list status verify resume install" -- "$cur") )
         return
     fi
     case "$prev" in
@@ -865,7 +948,7 @@ _btrfs_dup_completion() {
                 COMPREPLY+=( $(compgen -f -- "$cur") )
             fi
             ;;
-        resume|status|--resume)
+        resume|status|verify|--resume)
             COMPREPLY=( $(btrfs-dup list 2>/dev/null | cut -f1 | while read -r id; do [[ "$id" == "$cur"* ]] && printf '%s\n' "$id"; done) )
             ;;
     esac
@@ -882,6 +965,7 @@ _btrfs_dup() {
         'dedup:Start a guided scan or resume one'
         'list:List scans'
         'status:Show scan status'
+        'verify:Verify recorded duplicate contents'
         'resume:Resume a scan'
         'install:Install binary and shell completion'
     )
@@ -896,7 +980,7 @@ _btrfs_dup() {
                 '--resume[Resume a scan]:scan ID:' \
                 '*:mounted path or device:_files'
             ;;
-        resume|status)
+        resume|status|verify)
             _arguments '*:scan ID:($(btrfs-dup list 2>/dev/null | cut -f1))'
             ;;
     esac
@@ -1154,6 +1238,7 @@ async fn run_scan(table: &Table, mut scan: Scan) -> Result<()> {
         completed_bytes,
         duplicate_count,
         duplicate_bytes,
+        false,
     );
     println!(
         "Resuming: skipping {} completed files ({}).",
@@ -1637,6 +1722,168 @@ fn dedupe_live_ranges(
         DedupeResult::DataDiffers => Ok(0),
         DedupeResult::Error(code) => Err(format!("Btrfs dedupe target error: {code}").into()),
     }
+}
+
+fn verify_duplicates(scan: &Scan, duplicates: &[Duplicate]) -> Result<()> {
+    let root = Path::new(&scan.source);
+    let total_bytes = duplicates
+        .iter()
+        .fold(0u64, |total, duplicate| total.saturating_add(duplicate.len));
+    let inventory = Inventory {
+        files: duplicates.len() as u64,
+        blocks: duplicates.len() as u64,
+        bytes: total_bytes,
+        ..Inventory::default()
+    };
+    let mut progress = ScanProgress::new(&inventory, 0, 0, 0, 0, 0, true);
+    progress.draw(true)?;
+    let mut verified = 0u64;
+    let mut mismatches = 0u64;
+    let mut errors = 0u64;
+    for duplicate in duplicates {
+        let duplicate_path = PathBuf::from(std::ffi::OsString::from_vec(
+            duplicate.duplicate_path.clone(),
+        ));
+        let source_path =
+            PathBuf::from(std::ffi::OsString::from_vec(duplicate.source_path.clone()));
+        if duplicate.scan != scan.key()
+            || duplicate.len == 0
+            || !safe_relative_path(&duplicate_path)
+            || !safe_relative_path(&source_path)
+        {
+            errors += 1;
+            progress.duplicates += 1;
+            progress.log(format!(
+                "ANOMALY invalid stored duplicate relation: {} @ {} vs {} @ {} ({} bytes)",
+                duplicate_path.display(),
+                duplicate.duplicate_offset,
+                source_path.display(),
+                duplicate.source_offset,
+                duplicate.len
+            ))?;
+            update_verification_progress(&mut progress)?;
+            continue;
+        }
+        let len = match usize::try_from(duplicate.len) {
+            Ok(len) => len,
+            Err(error) => {
+                errors += 1;
+                progress.duplicates += 1;
+                progress.log(format!(
+                    "ANOMALY invalid duplicate length {}: {error}",
+                    duplicate.len
+                ))?;
+                update_verification_progress(&mut progress)?;
+                continue;
+            }
+        };
+        let duplicate_absolute = root.join(&duplicate_path);
+        let source_absolute = root.join(&source_path);
+        let result = (|| -> Result<bool> {
+            let mut duplicate_file = File::open(&duplicate_absolute)?;
+            let mut source_file = File::open(&source_absolute)?;
+            compare_file_ranges(
+                &mut duplicate_file,
+                duplicate.duplicate_offset,
+                &mut source_file,
+                duplicate.source_offset,
+                len,
+                &mut |bytes| {
+                    progress.bytes = progress.bytes.saturating_add(bytes);
+                    progress.draw(false)
+                },
+            )
+        })();
+        match result {
+            Ok(true) => {
+                verified += 1;
+            }
+            Ok(false) => {
+                mismatches += 1;
+                progress.duplicates += 1;
+                progress.log(format!(
+                    "ANOMALY contents differ: {} @ {} != {} @ {} ({} bytes)",
+                    duplicate_path.display(),
+                    duplicate.duplicate_offset,
+                    source_path.display(),
+                    duplicate.source_offset,
+                    duplicate.len
+                ))?;
+            }
+            Err(error) => {
+                errors += 1;
+                progress.duplicates += 1;
+                progress.log(format!(
+                    "ANOMALY could not verify {} @ {} vs {} @ {} ({} bytes): {error}",
+                    duplicate_path.display(),
+                    duplicate.duplicate_offset,
+                    source_path.display(),
+                    duplicate.source_offset,
+                    duplicate.len
+                ))?;
+            }
+        }
+        update_verification_progress(&mut progress)?;
+    }
+    progress.draw(true)?;
+    let compared_bytes = progress.bytes;
+    println!(
+        "Verification for scan {}: verified={}, mismatches={}, errors={}, compared={}",
+        scan.key(),
+        verified,
+        mismatches,
+        errors,
+        format_bytes(compared_bytes)
+    );
+    if mismatches > 0 || errors > 0 {
+        return Err(
+            format!("verification failed: {mismatches} mismatches and {errors} errors").into(),
+        );
+    }
+    Ok(())
+}
+
+fn update_verification_progress(progress: &mut ScanProgress) -> Result<()> {
+    progress.files += 1;
+    progress.blocks += 1;
+    progress.draw(false)
+}
+
+fn safe_relative_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+}
+
+fn compare_file_ranges(
+    duplicate: &mut File,
+    duplicate_offset: u64,
+    source: &mut File,
+    source_offset: u64,
+    len: usize,
+    on_compared: &mut impl FnMut(u64) -> Result<()>,
+) -> Result<bool> {
+    const COMPARE_BUFFER_SIZE: usize = 1024 * 1024;
+    duplicate.seek_to(duplicate_offset)?;
+    source.seek_to(source_offset)?;
+    let mut duplicate_buffer = vec![0; COMPARE_BUFFER_SIZE.min(len)];
+    let mut source_buffer = vec![0; COMPARE_BUFFER_SIZE.min(len)];
+    let mut remaining = len;
+    while remaining > 0 {
+        let chunk_len = remaining.min(duplicate_buffer.len());
+        duplicate.read_exact(&mut duplicate_buffer[..chunk_len])?;
+        source.read_exact(&mut source_buffer[..chunk_len])?;
+        on_compared(chunk_len as u64)?;
+        if duplicate_buffer[..chunk_len] != source_buffer[..chunk_len] {
+            return Ok(false);
+        }
+        remaining -= chunk_len;
+    }
+    Ok(true)
 }
 
 fn path_bytes(path: &Path) -> Vec<u8> {
