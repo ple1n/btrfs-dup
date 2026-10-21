@@ -5,6 +5,8 @@ database defaults to `./btrfs-dup.sqlite`. Use the global `--db <path>` option
 to choose another database file; the path can appear before or after the
 command. 
 
+![](./image.png)
+
 Build with the pinned Nix toolchain (including `libclang` and the GTK/WebKit
 libraries required by the desktop GUI):
 

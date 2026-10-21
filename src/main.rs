@@ -2313,16 +2313,24 @@ fn index_hashed_file(
                     ))?;
                 }
             }
-            let duplicate_source = members
-                .iter()
-                .find(|(candidate_path, _, candidate_digest)| {
-                    candidate_path != &file.path
-                        && candidate_digest.as_deref() == Some(digest.as_slice())
-                });
-            if let Some((candidate_snapshot, candidate_offset, _)) = duplicate_source {
+            let mut duplicate_source = None;
+            for (candidate_path, candidate_offset, candidate_digest) in members.iter() {
+                if candidate_path == &file.path
+                    || candidate_digest.as_deref() != Some(digest.as_slice())
+                {
+                    continue;
+                }
+                let relative = candidate_path.strip_prefix(&scan.snapshot)?;
+                let candidate_live = PathBuf::from(&scan.source).join(relative);
+                if same_file_inode(writable, &candidate_live)? {
+                    continue;
+                }
+                duplicate_source = Some((relative, candidate_offset));
+                break;
+            }
+            if let Some((relative, candidate_offset)) = duplicate_source {
                 progress.duplicates += 1;
                 progress.duplicate_bytes += len as u64;
-                let relative = candidate_snapshot.strip_prefix(&scan.snapshot)?;
                 let candidate_live = PathBuf::from(&scan.source).join(relative);
                 let (deduped_bytes, commited) = if scan.dry_run {
                     (0, false)
@@ -2362,6 +2370,15 @@ fn index_hashed_file(
     }
     progress.draw(false)?;
     Ok(())
+}
+
+fn same_file_inode(first: &Path, second: &Path) -> Result<bool> {
+    let first_metadata = fs::metadata(first)?;
+    let second_metadata = fs::metadata(second)?;
+    Ok(first_metadata.is_file()
+        && second_metadata.is_file()
+        && first_metadata.dev() == second_metadata.dev()
+        && first_metadata.ino() == second_metadata.ino())
 }
 
 fn hash_range(path: &Path, offset: u64, len: usize) -> Result<Vec<u8>> {
@@ -3052,6 +3069,31 @@ mod tests {
 
         assert!(batch.duplicates.is_empty());
         assert_eq!(progress.duplicates, 0);
+    }
+
+    #[test]
+    fn same_file_inode_detects_hardlink_paths() {
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        );
+        let original = std::env::temp_dir().join(format!("btrfs-dup-inode-{suffix}"));
+        let hardlink = std::env::temp_dir().join(format!("btrfs-dup-hardlink-{suffix}"));
+        let other = std::env::temp_dir().join(format!("btrfs-dup-other-{suffix}"));
+        fs::write(&original, b"same inode").expect("write original file");
+        fs::hard_link(&original, &hardlink).expect("create hard link");
+        fs::write(&other, b"different inode").expect("write different file");
+
+        assert!(same_file_inode(&original, &hardlink).expect("compare hardlink inode"));
+        assert!(!same_file_inode(&original, &other).expect("compare distinct inode"));
+
+        fs::remove_file(original).expect("remove original");
+        fs::remove_file(hardlink).expect("remove hardlink");
+        fs::remove_file(other).expect("remove other");
     }
 
     #[test]
